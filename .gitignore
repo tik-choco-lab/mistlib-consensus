@@ -1,0 +1,9 @@
+/target/
+**/*.rs.bk
+# wasm-pack output
+/mistlib-consensus-wasm/pkg/
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
+.omc
