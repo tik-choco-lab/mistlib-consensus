@@ -5,6 +5,20 @@
 コア (`mistlib-consensus-core`) と、それぞれの実行環境向けアダプタ
 (`mistlib-consensus-native` / `mistlib-consensus-wasm`) で構成される。
 
+## `mistlib-core` への依存
+
+`mistlib-core` は git 依存として `rev` 固定で参照している
+（`https://github.com/tik-choco-lab/mistlib-dev.git`）。以前は
+`../../mistlib-dev/mistlib-core` への相対パス依存だったため、この
+リポジトリ単体でベンダリング/クローンすると `mistlib-dev` を特定の
+兄弟ディレクトリに配置しない限りビルドできなかった（[#1](https://github.com/tik-choco-lab/mistlib-consensus/issues/1)）。
+git 依存化によりこの制約はなくなっている。
+
+`mistlib-core` 側の更新を取り込みたい場合は、各 `Cargo.toml` の
+`mistlib-core = { git = "...", rev = "..." }` の `rev` を
+`mistlib-dev` の最新コミットハッシュに書き換え、`cargo build` で
+`Cargo.lock` を更新すること。
+
 ## クレート構成
 
 ```
