@@ -1,87 +1,121 @@
 # mistlib-consensus
 
-`mistlib-dev` の上に構築した Raft コンセンサス実装。ネイティブと
-`wasm32-unknown-unknown` の両方でビルド可能な、プラットフォーム非依存の
-コア (`mistlib-consensus-core`) と、それぞれの実行環境向けアダプタ
-(`mistlib-consensus-native` / `mistlib-consensus-wasm`) で構成される。
+Consensus engines built on top of `mistlib-dev`, with a mode switch for
+the trust model of the underlying P2P mesh:
 
-## `mistlib-core` への依存
+| Mode | Fault model | Engine | Use case |
+|------|-------------|--------|----------|
+| `ConsensusMode::Trusted` | crash faults (CFT) | Raft | trusted P2P mesh |
+| `ConsensusMode::Untrusted` | Byzantine faults, `f = (n-1)/3` | chained HotStuff | untrusted P2P mesh |
 
-`mistlib-core` は git 依存として `rev` 固定で参照している
-（`https://github.com/tik-choco-lab/mistlib-dev.git`）。以前は
-`../../mistlib-dev/mistlib-core` への相対パス依存だったため、この
-リポジトリ単体でベンダリング/クローンすると `mistlib-dev` を特定の
-兄弟ディレクトリに配置しない限りビルドできなかった（[#1](https://github.com/tik-choco-lab/mistlib-consensus/issues/1)）。
-git 依存化によりこの制約はなくなっている。
+Both engines share the same architecture — a platform-agnostic core
+(`mistlib-consensus-core`) that builds natively and for
+`wasm32-unknown-unknown`, plus per-platform adapters
+(`mistlib-consensus-native` / `mistlib-consensus-wasm`). The
+`ConsensusNode` facade in `mode.rs` erases the engine choice behind a
+unified `propose` / `subscribe_committed` API. The wire protocols are
+incompatible, so every node in a cluster must be built in the same mode.
 
-`mistlib-core` 側の更新を取り込みたい場合は、各 `Cargo.toml` の
-`mistlib-core = { git = "...", rev = "..." }` の `rev` を
-`mistlib-dev` の最新コミットハッシュに書き換え、`cargo build` で
-`Cargo.lock` を更新すること。
+The HotStuff protocol design, safety rules, and v1 limitations are
+documented in [`docs/hotstuff-design.md`](docs/hotstuff-design.md).
 
-## クレート構成
+## Depending on `mistlib-core`
+
+`mistlib-core` is referenced as a git dependency pinned to a `rev`
+(`https://github.com/tik-choco-lab/mistlib-dev.git`). It used to be a
+relative-path dependency on `../../mistlib-dev/mistlib-core`, which made
+this repository unbuildable when vendored/cloned standalone unless
+`mistlib-dev` sat in a specific sibling directory
+([#1](https://github.com/tik-choco-lab/mistlib-consensus/issues/1)).
+The git dependency removes that constraint.
+
+To pick up changes from `mistlib-core`, bump the `rev` in each
+`Cargo.toml`'s `mistlib-core = { git = "...", rev = "..." }` to the
+latest `mistlib-dev` commit hash and run `cargo build` to refresh
+`Cargo.lock`.
+
+## Crate layout
 
 ```
 mistlib-consensus/
-├── mistlib-consensus-core    # Raft本体（純粋・非同期・プラットフォーム非依存）
-├── mistlib-consensus-native  # TokioRuntime + ネイティブ向け起動ヘルパー
-└── mistlib-consensus-wasm    # WasmRuntime + wasm-bindgen FFI ラッパー
+├── mistlib-consensus-core    # Raft + HotStuff cores (pure, async-driven, platform-agnostic)
+│   └── src/hotstuff/         # chained HotStuff BFT engine (state, node, crypto, storage, transport)
+├── mistlib-consensus-native  # TokioRuntime + native startup helpers
+└── mistlib-consensus-wasm    # WasmRuntime + wasm-bindgen FFI wrappers
 ```
 
-## アーキテクチャ
+## Architecture
 
-### 1. 純粋なステートマシン (`state.rs`)
+Both engines follow the same sans-IO pattern; the Raft variants are
+described here, and the HotStuff counterparts mirror them one-for-one
+(`hotstuff/state.rs`, `hotstuff/node.rs`, `hotstuff/transport.rs`,
+`hotstuff/storage.rs`, plus `hotstuff/crypto.rs` for signatures).
 
-`RaftState<S: RaftStorage>` は Raft のコアロジックを **同期・非async** で実装する。
-`step(event: Event) -> Vec<Output>` という純関数型のインターフェースを持ち、
+### 1. Pure state machine (`state.rs`)
 
-- `Event`: `Message`（他ノードからの RPC）, `ElectionTimeout`,
+`RaftState<S: RaftStorage>` implements the core Raft logic
+**synchronously, without async**. It exposes a purely functional
+`step(event: Event) -> Vec<Output>` interface over:
+
+- `Event`: `Message` (RPCs from other nodes), `ElectionTimeout`,
   `HeartbeatTimeout`, `ClientPropose`, `AddPeer`/`RemovePeer`
 - `Output`: `SendMessage`, `ApplyCommitted`, `BecameLeader`/`BecameFollower`,
   `ResetElectionTimer`/`ResetHeartbeatTimer`, `Proposed`/`ProposeRejected`
 
-を入出力する。I/O や時間を一切扱わないため、`mistlib-consensus-core/src/state.rs`
-の `#[cfg(test)]` にあるユニットテストのように、モックなしで決定論的に
-テストできる（選挙の多数決、より高い term によるフォロワー降格、
-ログ複製とコミット位置の前進、競合エントリの切り詰め、古いログを持つ
-候補者への投票拒否）。
+Because it never touches I/O or the clock, it can be tested
+deterministically without mocks — see the `#[cfg(test)]` unit tests in
+`mistlib-consensus-core/src/state.rs` (election majorities, stepping
+down on a higher term, log replication and commit advancement,
+truncating conflicting entries, refusing votes to candidates with stale
+logs). `hotstuff/state.rs` gets the same treatment for the BFT rules
+(3-chain commits, lock conflicts, quorum counting, forged-signature
+rejection, timeout recovery).
 
-### 2. トランスポート (`transport.rs`)
+### 2. Transport (`transport.rs`)
 
-`RaftTransport` トレイトは `mistlib-core` の `L1Transport` と同じ
-`#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` パターンを踏襲し、
-`send(&self, to, msg) -> Result<()>` のみを要求する薄い抽象。
+The `RaftTransport` trait follows the same
+`#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` pattern as
+`mistlib-core`'s `L1Transport` and only requires
+`send(&self, to, msg) -> Result<()>`.
 
-- `MistTransport`: `Arc<dyn L1Transport>` をラップし、`bincode` で
-  シリアライズして `DeliveryMethod::ReliableOrdered` で送信する。
-  受信側は `handle_incoming(from, bytes)` でバイト列を投入すると、
-  内部の `mpsc` チャンネル経由で `RaftNode` に届く
-  （`RaftNode::attach_inbound` で購読する）。
-- `mistlib-consensus-wasm::CallbackTransport`: 実際の送信を
-  JavaScript 側のコールバックに委譲する（後述）。
+- `MistTransport` wraps an `Arc<dyn L1Transport>`, serializes with
+  `bincode`, and sends with `DeliveryMethod::ReliableOrdered`. On the
+  receive side, feed raw bytes into `handle_incoming(from, bytes)` and
+  they reach the `RaftNode` through an internal `mpsc` channel
+  (subscribe with `RaftNode::attach_inbound`).
+- `mistlib-consensus-wasm::CallbackTransport` delegates actual sending
+  to a JavaScript callback (see below).
+- The HotStuff twin (`hotstuff/transport.rs`) additionally caps decoded
+  message size (`MAX_WIRE_MESSAGE_BYTES`) because it faces explicitly
+  untrusted peers.
 
-### 3. 駆動ループ (`node.rs`)
+### 3. Driver loop (`node.rs`)
 
-`RaftNode<S>` は `RaftState<S>` を async イベントループで駆動する:
+`RaftNode<S>` drives `RaftState<S>` from an async event loop:
 
-- `AsyncRuntime::spawn` でイベントループ本体・選挙タイマー・
-  ハートビートタイマーの3タスクを起動する。
-- `tokio::select!` は使わない（`mistlib-core` の `tokio` 依存が
-  `features = ["sync"]` のみで `macros`/`rt` を含まないため）。
-  代わりに、選挙タイマーは `AtomicU64` の epoch カウンタで
-  「スリープ中にリセットされたか」を判定する方式で再実装している。
-- タイムアウトは `election_timeout_min_ms..=election_timeout_max_ms`
-  からランダムに選ぶ（既定 150–300ms）。ハートビート間隔は既定 50ms。
-- 状態機械の変更はすべて単一タスク内でのみ行われるため、
-  排他制御は不要。`role()`/`leader_hint()` など外部公開の読み取り用に
-  `std::sync::Mutex<Status>` を一つだけ使っている。
+- `AsyncRuntime::spawn` launches three tasks: the event loop itself, the
+  election timer, and the heartbeat timer.
+- Timer resets are detected with an `AtomicU64` epoch counter rather
+  than by cancelling sleeps: a timer that wakes up checks whether the
+  epoch moved while it slept. (`HotStuffNode` reuses the same trick for
+  its single view timer, whose duration changes per view due to
+  exponential backoff.)
+- Election timeouts are drawn randomly from
+  `election_timeout_min_ms..=election_timeout_max_ms` (default
+  150–300 ms); the heartbeat interval defaults to 50 ms.
+- All state-machine mutation happens on a single task, so no locking is
+  needed for the protocol itself. A single `std::sync::Mutex<Status>`
+  serves external read-only accessors like `role()`/`leader_hint()`.
 
-### 4. ストレージ (`storage.rs`)
+### 4. Storage (`storage.rs`)
 
-`RaftStorage` トレイトは term・投票先・ログを永続化する責務を持つ。
-`MemoryStorage` はテスト・単一プロセス用の非永続実装。
+The `RaftStorage` trait owns persistence of the term, the vote, and the
+log. `MemoryStorage` is a non-durable implementation for tests and
+single-process use. The HotStuff counterpart is `BlockStore`
+(`hotstuff/storage.rs`), which persists the block tree plus the
+safety-critical `last_voted_view` / `locked_qc` / `high_qc` fields.
 
-## 公開 API（`mistlib-consensus-core`）
+## Public API (`mistlib-consensus-core`)
 
 ```rust
 let node: Arc<RaftNode<MemoryStorage>> = RaftNode::new(
@@ -94,12 +128,12 @@ let node: Arc<RaftNode<MemoryStorage>> = RaftNode::new(
 );
 node.start();
 
-// リーダーの場合のみ成功し、ログ index を返す
+// Succeeds only on the leader; returns the log index.
 let index = node.propose(b"command".to_vec()).await?;
 
-// コミットされたエントリを購読
+// Subscribe to committed entries.
 let mut rx = node.subscribe_committed();
-while let Ok(entry) = rx.recv().await { /* entry.command を適用 */ }
+while let Ok(entry) = rx.recv().await { /* apply entry.command */ }
 
 node.role();         // Option<Role>
 node.leader_hint();  // Option<NodeId>
@@ -108,6 +142,40 @@ node.remove_peer(id);
 node.shutdown();
 ```
 
+### Consensus modes
+
+`HotStuffNode` exposes the same shape of API (see the module docs of
+`hotstuff/node.rs`); the `ConsensusNode` facade unifies the two:
+
+```rust
+use mistlib_consensus_core::{ConsensusMode, ConsensusNode};
+use mistlib_consensus_core::hotstuff::{
+    Ed25519Crypto, HotStuffNode, MemoryBlockStore, PacemakerConfig,
+};
+
+// Trusted P2P: Raft.
+let node = ConsensusNode::trusted(raft_node);
+
+// Untrusted P2P: chained HotStuff with Ed25519 quorum certificates.
+// The caller supplies the signing key and the validator key registry.
+let hs = HotStuffNode::new(
+    id, validators, PacemakerConfig::default(),
+    runtime.clone(), transport,
+    MemoryBlockStore::new(),
+    Ed25519Crypto::new(signing_key, registry),
+);
+hs.start();
+let node = ConsensusNode::untrusted(hs);
+
+// Same API in either mode.
+let seq = node.propose(b"command".to_vec()).await?;
+let mut committed = node.subscribe_committed(&runtime);
+while let Some(cmd) = committed.recv().await { /* apply cmd.command */ }
+```
+
+For tests or semi-trusted meshes, `NoopCrypto` disables signing while
+keeping HotStuff's deterministic leader rotation.
+
 ## `mistlib-consensus-native`
 
 ```rust
@@ -115,12 +183,16 @@ let node = mistlib_consensus_native::spawn_native(
     NodeId("a".into()), peers, RaftConfig::default(), transport, MemoryStorage::new(),
 );
 ```
-`TokioRuntime::current()`（アンビエントな Tokio ランタイムのハンドル）を
-使って `RaftNode` を構築し、即座に `start()` する便利関数。
+
+A convenience function that builds a `RaftNode` on
+`TokioRuntime::current()` (a handle to the ambient Tokio runtime) and
+calls `start()` immediately. (HotStuff spawn helpers are not wired into
+the native/wasm adapters yet; construct `HotStuffNode` directly as
+shown above.)
 
 ## `mistlib-consensus-wasm`
 
-`wasm-pack build --target web` でビルドし、JS から次のように使う:
+Build with `wasm-pack build --target web` and use from JS:
 
 ```js
 import init, { WasmRaftNode, initPanicHook } from "./pkg/mistlib_consensus_wasm.js";
@@ -130,13 +202,13 @@ initPanicHook();
 
 const node = new WasmRaftNode("a", JSON.stringify(["b", "c"]), null);
 
-// 実際のネットワーク送信は呼び出し側が実装する
-// （WebSocket や mistlib の L1Transport への橋渡しなど）
+// The caller implements the actual network send
+// (WebSocket, or a bridge to mistlib's L1Transport).
 node.setSendCallback((toNodeId, bytes) => {
   mesh.sendTo(toNodeId, bytes);
 });
 
-// 受信したバイト列をここに流し込む
+// Feed received bytes back in here.
 mesh.onMessage((from, bytes) => node.handleIncoming(from, bytes));
 
 node.onCommitted((bytes) => applyToStateMachine(bytes));
@@ -147,24 +219,25 @@ const index = await node.propose(new TextEncoder().encode("hello"));
 console.log(node.role(), node.leaderHint());
 ```
 
-wasm 側は `AsyncRuntime` を `wasm_bindgen_futures::spawn_local` +
-`gloo-timers` で実装した `WasmRuntime` を使う。トランスポートは
-`mistlib-core::layers::l1::L1Transport` を直接使わず、JS コールバック
-ベースの `CallbackTransport` を使う設計にしてある。これは、
-wasm 環境では実際のネットワーク実装（WebSocket / WebRTC / mistlib の
-メッシュ）が JS 側に存在することが多く、Rust 側で `L1Transport` の
-具体実装を持たせるより、送受信のバイト列だけを橋渡しする方が
-疎結合になるため。`mistlib-wasm` 側で `L1Transport` を実装している
-場合は、その送信メソッドの中から `handleIncoming` を呼ぶ橋渡しコードを
-JS（または `mistlib-wasm` 自体）に数行書くだけで統合できる。
+The wasm side implements `AsyncRuntime` with
+`wasm_bindgen_futures::spawn_local` + `gloo-timers` (`WasmRuntime`).
+The transport deliberately avoids using
+`mistlib-core::layers::l1::L1Transport` directly in favor of the
+JS-callback-based `CallbackTransport`: in wasm environments the real
+network implementation (WebSocket / WebRTC / mistlib's mesh) usually
+lives on the JS side, and bridging raw bytes is looser coupling than
+holding a concrete `L1Transport` in Rust. If `mistlib-wasm` implements
+`L1Transport`, integration is a few lines of JS (or `mistlib-wasm`
+code) calling `handleIncoming` from its receive path.
 
-## mistlib L1Transport との統合
+## Integrating with mistlib's L1Transport
 
-ネイティブ側は `MistTransport::new(Arc<dyn L1Transport>)` で
-`(RaftTransport, mpsc::UnboundedReceiver<(NodeId, RaftMessage)>)` を
-得られる。受信経路は `L1Notifier`/メッセージディスパッチャ側から
-`mist_transport.handle_incoming(&from, &bytes)` を呼び、返ってきた
-receiver を `RaftNode::attach_inbound(rx)` に渡すだけでよい。
+On native, `MistTransport::new(Arc<dyn L1Transport>)` yields
+`(RaftTransport, mpsc::UnboundedReceiver<(NodeId, RaftMessage)>)`. Wire
+the receive path by calling
+`mist_transport.handle_incoming(&from, &bytes)` from your
+`L1Notifier`/message dispatcher, and hand the receiver to
+`RaftNode::attach_inbound(rx)`.
 
 ```rust
 let (transport, inbound_rx) = MistTransport::new(l1_transport);
@@ -173,13 +246,18 @@ node.attach_inbound(inbound_rx);
 node.start();
 ```
 
-## テスト
+`HotStuffMistTransport` provides the identical shape for HotStuff.
 
-- `mistlib-consensus-core`: 純粋ステートマシンのユニットテスト5件
-  （`state.rs`）+ モックトランスポートによる3ノードの結合テスト1件
-  （`tests/cluster.rs`、`#[cfg(not(target_arch = "wasm32"))]`）。
-- `mistlib-consensus-native`: 単一ノードクラスタがリーダーになり
-  `propose` が成功することを確認するスモークテスト（`tests/smoke.rs`）。
+## Tests
+
+- `mistlib-consensus-core`: deterministic unit tests for both pure state
+  machines (`state.rs`, `hotstuff/state.rs`), plus mock-transport
+  cluster integration tests (`tests/cluster.rs`,
+  `tests/cluster_advanced.rs`, `tests/hotstuff_cluster.rs` — leader
+  failover/silence, partitions, an end-to-end Ed25519-signed HotStuff
+  run, and the mode facade; all `#[cfg(not(target_arch = "wasm32"))]`).
+- `mistlib-consensus-native`: a smoke test that a single-node cluster
+  becomes leader and `propose` succeeds (`tests/smoke.rs`).
 
 ```sh
 cargo build --workspace
@@ -189,23 +267,28 @@ cargo build -p mistlib-consensus-wasm --target wasm32-unknown-unknown
 cargo clippy --workspace
 ```
 
-## 既知の逸脱・注意点
+## Known deviations and caveats
 
-- `RaftMessage::RequestVoteResponse`/`AppendEntriesResponse` に、仕様書の
-  フィールド一覧にはなかった `voter_id`/`follower_id` を追加した。
-  `RaftTransport::send` は宛先 (`to`) しか指定できず、応答メッセージの
-  送信元が誰かを `RaftState` 側が判別する手段がないため
-  （匿名の点対点リンクの向こう側から届く前提）、これを message 自体に
-  含めている。
-- メンバーシップ変更は仕様通り joint consensus なしの単純な
-  `add_peer`/`remove_peer`（設定変更自体はログを経由しない）。
-  本番運用では、より厳密には設定変更もログエントリとして複製すべき
-  だが、今回のスコープでは意図的に単純化した。
-- `RaftStorage::MemoryStorage` は非永続。実運用ではディスク永続化した
-  実装に差し替える必要がある。
-- `mistlib-consensus-wasm` の `WasmRuntime::sleep` は非 wasm32
-  ターゲットでビルドする際、内部で `std::future::ready(())` を使う
-  ノーオップにフォールバックする（`gloo-timers` の `Timeout` が
-  `wasm_bindgen::Closure` を保持しており `Send` ではないため、
-  `async-trait` の非wasm経路が要求する `Send` 境界を満たせない）。
-  `WasmRuntime` は wasm32 以外で実際に使われることを意図していない。
+- `RaftMessage::RequestVoteResponse`/`AppendEntriesResponse` carry
+  `voter_id`/`follower_id` fields that are not in the spec sheet's field
+  list. `RaftTransport::send` only addresses a destination (`to`) and
+  `RaftState` has no way to tell who a response came from (messages are
+  assumed to arrive over anonymous point-to-point links), so the sender
+  is embedded in the message itself.
+- Membership changes are plain `add_peer`/`remove_peer` without joint
+  consensus, per the spec (configuration changes do not go through the
+  log). A production deployment should replicate configuration changes
+  as log entries; this was deliberately simplified for the current
+  scope. The same operator-trusted simplification applies to HotStuff
+  membership (BFT reconfiguration is out of scope for v1 — see
+  `docs/hotstuff-design.md`).
+- `MemoryStorage` / `MemoryBlockStore` are non-durable. Production use
+  requires disk-backed implementations — for HotStuff this is
+  safety-critical (a replica that forgets `last_voted_view` or
+  `locked_qc` can be tricked into equivocating after a restart).
+- `mistlib-consensus-wasm`'s `WasmRuntime::sleep` falls back to a no-op
+  `std::future::ready(())` when built for non-wasm32 targets
+  (`gloo-timers`' `Timeout` holds a `wasm_bindgen::Closure` and is not
+  `Send`, so it cannot satisfy the `Send` bound required by
+  `async-trait`'s non-wasm path). `WasmRuntime` is not intended for
+  actual use outside wasm32.
