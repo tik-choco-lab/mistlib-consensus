@@ -20,6 +20,19 @@ pub enum RaftError {
 
     #[error("internal channel closed")]
     ChannelClosed,
+
+    #[error("invalid quorum certificate: {0}")]
+    InvalidCertificate(String),
+
+    #[error("invalid block: {0}")]
+    InvalidBlock(String),
+
+    #[error("node is not in the validator set")]
+    NotValidator,
 }
+
+/// Alias for readers coming from the consensus-mode facade; both the
+/// Raft and HotStuff engines share this error type.
+pub type ConsensusError = RaftError;
 
 pub type Result<T> = std::result::Result<T, RaftError>;
