@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 mistlib-consensus-core = { path = "../mistlib-consensus-core" }
-mistlib-core = { git = "https://github.com/tik-choco-lab/mistlib-dev.git", rev = "da81500c7c1c92dca027b8d08b826e3ce8f70df9" }
+mistlib-core = { git = "https://github.com/tik-choco-lab/mistlib.git", tag = "v0.6.0" }
 async-trait = "0.1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

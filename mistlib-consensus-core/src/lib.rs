@@ -6,7 +6,8 @@
 //! and `L1Transport` abstractions. Compiles for native targets and for
 //! `wasm32-unknown-unknown`.
 //!
-//! See the crate README for an architecture overview.
+//! See `docs/architecture.md` for an architecture overview and
+//! `docs/hotstuff-design.md` for the HotStuff protocol design.
 
 pub mod config;
 pub mod error;
