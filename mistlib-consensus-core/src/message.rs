@@ -1,3 +1,4 @@
+use crate::storage::RaftSnapshot;
 use mistlib_core::types::NodeId;
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,24 @@ pub enum RaftMessage {
         /// Who is replying.
         follower_id: NodeId,
     },
+    InstallSnapshot {
+        term: u64,
+        leader_id: NodeId,
+        snapshot: RaftSnapshot,
+    },
+    InstallSnapshotResponse {
+        term: u64,
+        follower_id: NodeId,
+        success: bool,
+        last_included_index: u64,
+    },
+    AppendEntriesConflict {
+        term: u64,
+        follower_id: NodeId,
+        conflict_index: u64,
+        conflict_term: Option<u64>,
+        rejected_prev_index: u64,
+    },
 }
 
 impl RaftMessage {
@@ -49,6 +68,9 @@ impl RaftMessage {
             RaftMessage::RequestVoteResponse { term, .. } => *term,
             RaftMessage::AppendEntries { term, .. } => *term,
             RaftMessage::AppendEntriesResponse { term, .. } => *term,
+            RaftMessage::InstallSnapshot { term, .. } => *term,
+            RaftMessage::InstallSnapshotResponse { term, .. } => *term,
+            RaftMessage::AppendEntriesConflict { term, .. } => *term,
         }
     }
 }

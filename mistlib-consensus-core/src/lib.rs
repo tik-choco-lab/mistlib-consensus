@@ -22,11 +22,11 @@ pub mod transport;
 pub use config::RaftConfig;
 pub use error::{ConsensusError, RaftError, Result};
 pub use hotstuff::{CommittedCommand, HotStuffNode};
-pub use mode::{ConsensusMode, ConsensusNode};
 pub use message::{LogEntry, RaftMessage};
-pub use node::RaftNode;
+pub use mode::{ConsensusMode, ConsensusNode};
+pub use node::{RaftApplied, RaftNode};
 pub use state::{Event, Output, RaftState, Role};
-pub use storage::{MemoryStorage, RaftStorage};
+pub use storage::{MemoryStorage, RaftMembership, RaftSnapshot, RaftStorage};
 pub use transport::{MistTransport, RaftTransport};
 
 // Re-exported so downstream crates don't need a direct mistlib-core

@@ -2,7 +2,7 @@ use crate::config::RaftConfig;
 use crate::error::{RaftError, Result};
 use crate::message::{LogEntry, RaftMessage};
 use crate::state::{Event, Output, RaftState, Role};
-use crate::storage::RaftStorage;
+use crate::storage::{RaftMembership, RaftSnapshot, RaftStorage};
 use crate::transport::RaftTransport;
 use mistlib_core::runtime::AsyncRuntime;
 use mistlib_core::types::NodeId;
@@ -21,11 +21,19 @@ enum NodeEvent {
     Shutdown,
 }
 
+#[derive(Debug, Clone)]
+pub enum RaftApplied {
+    Entries(Vec<LogEntry>),
+    Snapshot(RaftSnapshot),
+}
+
 #[derive(Debug, Clone, Default)]
 struct Status {
     role: Option<Role>,
     leader_hint: Option<NodeId>,
     running: bool,
+    membership: Option<RaftMembership>,
+    committed_membership: Option<RaftMembership>,
 }
 
 /// Drives a [`RaftState`] machine over time using an [`AsyncRuntime`]
@@ -42,6 +50,7 @@ pub struct RaftNode<S: RaftStorage + 'static> {
     state: Mutex<Option<RaftState<S>>>,
     status: Arc<Mutex<Status>>,
     committed_tx: broadcast::Sender<LogEntry>,
+    applied_tx: broadcast::Sender<RaftApplied>,
     election_epoch: Arc<AtomicU64>,
 }
 
@@ -54,12 +63,35 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
         transport: Arc<dyn RaftTransport>,
         storage: S,
     ) -> Arc<Self> {
+        let state = RaftState::new(id, peers, storage);
+        Self::from_state(state, config, runtime, transport)
+    }
+
+    /// Construct a node with an explicit immutable initial membership.
+    /// Learners and nonmembers remain passive until a logged promotion.
+    pub fn with_membership(
+        id: NodeId,
+        membership: RaftMembership,
+        config: RaftConfig,
+        runtime: Arc<dyn AsyncRuntime>,
+        transport: Arc<dyn RaftTransport>,
+        storage: S,
+    ) -> Option<Arc<Self>> {
+        let state = RaftState::with_membership(id, membership, storage)?;
+        Some(Self::from_state(state, config, runtime, transport))
+    }
+
+    fn from_state(
+        state: RaftState<S>,
+        config: RaftConfig,
+        runtime: Arc<dyn AsyncRuntime>,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (committed_tx, _) = broadcast::channel(1024);
-        let state = RaftState::new(id.clone(), peers, storage);
-
+        let (applied_tx, _) = broadcast::channel(1024);
         Arc::new(Self {
-            id,
+            id: state.id.clone(),
             config,
             runtime,
             transport,
@@ -68,6 +100,7 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
             state: Mutex::new(Some(state)),
             status: Arc::new(Mutex::new(Status::default())),
             committed_tx,
+            applied_tx,
             election_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -140,10 +173,18 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
                     }));
                 }
                 Output::ApplyCommitted { entries } => {
+                    let _ = self.applied_tx.send(RaftApplied::Entries(entries.clone()));
                     for entry in entries {
                         let _ = self.committed_tx.send(entry);
                     }
                 }
+                Output::InstallSnapshot { snapshot } => {
+                    let _ = self.applied_tx.send(RaftApplied::Snapshot(snapshot));
+                }
+                Output::SnapshotCompacted { .. }
+                | Output::SnapshotRejected
+                | Output::MembershipChanged { .. }
+                | Output::MembershipRejected => {}
                 Output::BecameLeader => {
                     let mut status = self.status.lock().unwrap();
                     status.role = Some(Role::Leader);
@@ -173,10 +214,12 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
         // BecameFollower output fired this step (e.g. plain vote grants).
         let mut status = self.status.lock().unwrap();
         status.role = Some(state.role);
+        status.membership = Some(state.membership.clone());
+        status.committed_membership = Some(state.committed_membership());
         if state.role == Role::Leader {
             status.leader_hint = Some(self.id.clone());
-        } else if let Some(leader) = &state.leader_id {
-            status.leader_hint = Some(leader.clone());
+        } else {
+            status.leader_hint = state.leader_id.clone();
         }
     }
 
@@ -197,7 +240,10 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
                     break;
                 }
                 if this.election_epoch.load(Ordering::SeqCst) == epoch_before
-                    && this.events_tx.send(NodeEvent::Raft(Event::ElectionTimeout)).is_err()
+                    && this
+                        .events_tx
+                        .send(NodeEvent::Raft(Event::ElectionTimeout))
+                        .is_err()
                 {
                     break;
                 }
@@ -215,7 +261,11 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
                 if !this.status.lock().unwrap().running {
                     break;
                 }
-                if this.events_tx.send(NodeEvent::Raft(Event::HeartbeatTimeout)).is_err() {
+                if this
+                    .events_tx
+                    .send(NodeEvent::Raft(Event::HeartbeatTimeout))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -224,7 +274,9 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
 
     /// Feeds a message received from the network into this node.
     pub fn deliver(&self, from: NodeId, msg: RaftMessage) {
-        let _ = self.events_tx.send(NodeEvent::Raft(Event::Message { from, msg }));
+        let _ = self
+            .events_tx
+            .send(NodeEvent::Raft(Event::Message { from, msg }));
     }
 
     /// Spawns a background task that forwards every `(from, msg)` pair
@@ -249,13 +301,46 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
     pub async fn propose(&self, command: Vec<u8>) -> Result<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.events_tx
-            .send(NodeEvent::Propose { command, reply: reply_tx })
+            .send(NodeEvent::Propose {
+                command,
+                reply: reply_tx,
+            })
             .map_err(|_| RaftError::ShuttingDown)?;
         reply_rx.await.map_err(|_| RaftError::ChannelClosed)?
     }
 
     pub fn subscribe_committed(&self) -> broadcast::Receiver<LogEntry> {
         self.committed_tx.subscribe()
+    }
+
+    /// Ordered application stream including snapshots. Snapshot-aware consumers
+    /// must use this stream instead of only subscribe_committed, and recover
+    /// from durable storage if the bounded receiver reports lag.
+    pub fn subscribe_applied(&self) -> broadcast::Receiver<RaftApplied> {
+        self.applied_tx.subscribe()
+    }
+
+    pub fn compact_snapshot(&self, index: u64, data: Vec<u8>) {
+        let _ = self
+            .events_tx
+            .send(NodeEvent::Raft(Event::CompactSnapshot { index, data }));
+    }
+
+    pub fn change_membership(&self, voters: Vec<NodeId>, learners: Vec<NodeId>) {
+        let _ = self
+            .events_tx
+            .send(NodeEvent::Raft(Event::ChangeMembership {
+                voters,
+                learners,
+            }));
+    }
+
+    pub fn membership(&self) -> Option<RaftMembership> {
+        self.status.lock().unwrap().membership.clone()
+    }
+
+    pub fn committed_membership(&self) -> Option<RaftMembership> {
+        self.status.lock().unwrap().committed_membership.clone()
     }
 
     pub fn role(&self) -> Option<Role> {
@@ -267,14 +352,37 @@ impl<S: RaftStorage + 'static> RaftNode<S> {
     }
 
     pub fn add_peer(&self, peer: NodeId) {
-        let _ = self.events_tx.send(NodeEvent::Raft(Event::AddPeer { peer }));
+        let _ = self
+            .events_tx
+            .send(NodeEvent::Raft(Event::AddPeer { peer }));
     }
 
     pub fn remove_peer(&self, peer: NodeId) {
-        let _ = self.events_tx.send(NodeEvent::Raft(Event::RemovePeer { peer }));
+        let _ = self
+            .events_tx
+            .send(NodeEvent::Raft(Event::RemovePeer { peer }));
     }
 
     pub fn shutdown(&self) {
         let _ = self.events_tx.send(NodeEvent::Shutdown);
+    }
+}
+
+impl RaftNode<crate::storage::MemoryStorage> {
+    /// Transient advisory election only. Peer discovery changes the electorate
+    /// directly; commands, snapshots, and durable reconfiguration are disabled.
+    pub fn new_ephemeral(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        config: RaftConfig,
+        runtime: Arc<dyn AsyncRuntime>,
+        transport: Arc<dyn RaftTransport>,
+    ) -> Arc<Self> {
+        Self::from_state(
+            RaftState::new_ephemeral(id, peers),
+            config,
+            runtime,
+            transport,
+        )
     }
 }
