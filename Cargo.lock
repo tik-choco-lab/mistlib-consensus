@@ -608,8 +608,8 @@ dependencies = [
 
 [[package]]
 name = "mistlib-core"
-version = "0.6.0"
-source = "git+https://github.com/tik-choco-lab/mistlib.git?tag=v0.6.0#349e4317741c88ed435401ef7362dce2e69f3b4d"
+version = "0.7.1"
+source = "git+https://github.com/tik-choco-lab/mistlib.git?tag=v0.7.1#ec586ec8481edcd2463db4c7d60fd8223ab33eea"
 dependencies = [
  "aes-gcm",
  "anyhow",

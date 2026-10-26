@@ -5,7 +5,7 @@
 **面向点对点网格的复制状态机 —— 信得过对等节点就用 Raft，信不过就用 HotStuff。**
 
 [![status](https://img.shields.io/badge/status-experimental-orange)](#状态)
-[![engine](https://img.shields.io/badge/mistlib-v0.6.0-2f6feb)](https://github.com/tik-choco-lab/mistlib)
+[![engine](https://img.shields.io/badge/mistlib-v0.7.1-2f6feb)](https://github.com/tik-choco-lab/mistlib)
 [![license](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
 
 [English](README.md) · [日本語](README.ja.md) · 简体中文

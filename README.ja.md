@@ -5,7 +5,7 @@
 **P2P メッシュのための複製ステートマシン — ピアを信頼できるなら Raft、できないなら HotStuff。**
 
 [![status](https://img.shields.io/badge/status-experimental-orange)](#ステータス)
-[![engine](https://img.shields.io/badge/mistlib-v0.6.0-2f6feb)](https://github.com/tik-choco-lab/mistlib)
+[![engine](https://img.shields.io/badge/mistlib-v0.7.1-2f6feb)](https://github.com/tik-choco-lab/mistlib)
 [![license](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE)
 
 [English](README.md) · 日本語 · [简体中文](README.zh.md)

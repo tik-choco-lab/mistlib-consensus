@@ -5,7 +5,7 @@ edition = "2021"
 license = "MPL-2.0"
 
 [dependencies]
-mistlib-core = { git = "https://github.com/tik-choco-lab/mistlib.git", tag = "v0.6.0" }
+mistlib-core = { git = "https://github.com/tik-choco-lab/mistlib.git", tag = "v0.7.1" }
 serde = { version = "1.0", features = ["derive"] }
 bytes = { version = "1.0", features = ["serde"] }
 async-trait = "0.1"
