@@ -10,13 +10,13 @@ use super::message::{
 };
 use super::storage::BlockStore;
 use mistlib_core::types::NodeId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Timing knobs for the pacemaker (driven by the node, decided here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacemakerConfig {
     /// Base view timeout. Doubles per consecutive timeout (exponential
-    /// backoff) until a QC advances the view again.
+    /// backoff) until the commit chain makes progress again.
     pub base_timeout_ms: u64,
     /// Upper bound for the backed-off timeout.
     pub max_timeout_ms: u64,
@@ -94,7 +94,7 @@ pub struct HotStuffState<B: BlockStore, C: CryptoProvider> {
     config: PacemakerConfig,
 
     pub current_view: ViewNumber,
-    /// Consecutive timeouts since the last QC-driven view advance.
+    /// Consecutive timeouts since the last committed block.
     consecutive_timeouts: u32,
     /// Highest view this node proposed in (at most one proposal/view).
     last_proposed_view: ViewNumber,
@@ -109,6 +109,12 @@ pub struct HotStuffState<B: BlockStore, C: CryptoProvider> {
     /// Distinct `NewView` senders per view, used on the timeout path to
     /// decide when this leader may propose (needs a quorum of them).
     new_views: HashMap<ViewNumber, HashSet<NodeId>>,
+    /// Authenticated proposals waiting for an in-flight parent. Messages
+    /// from successive leaders can arrive in either order.
+    pending_proposals: HashMap<BlockHash, Vec<Block>>,
+    /// Recovery proposals can arrive before our local timeout enters their
+    /// view. A leader signature alone cannot authorize skipping views.
+    future_proposals: BTreeMap<ViewNumber, Vec<Block>>,
     /// Whether this node led the view it most recently entered, so
     /// `BecameLeader`/`BecameFollower` fire only on genuine transitions.
     was_leader: bool,
@@ -147,6 +153,8 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             pending_commands: Vec::new(),
             votes: HashMap::new(),
             new_views: HashMap::new(),
+            pending_proposals: HashMap::new(),
+            future_proposals: BTreeMap::new(),
             was_leader: false,
             in_propose: false,
             exec_sequence: 0,
@@ -160,7 +168,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     /// proposal extending the genesis block).
     pub fn bootstrap(&mut self) -> Vec<Output> {
         let mut out = Vec::new();
-        if self.enter_view(1, true, &mut out) {
+        if self.enter_view(1, &mut out) {
             self.propose(&mut out);
         }
         out
@@ -224,29 +232,29 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
                 }
             }
         }
+        // A timeout or QC may have made an early recovery proposal eligible.
+        // Iterate because voting on it can admit another queued view.
+        while let Some(blocks) = self.future_proposals.remove(&self.current_view) {
+            for block in blocks {
+                self.process_proposal(block, &mut out);
+            }
+        }
+        self.future_proposals.retain(|&v, _| v > self.current_view);
         out
     }
 
     // ----- private protocol helpers -----
 
     /// Enter `new_view` if it is strictly ahead of the current view.
-    /// Returns whether the view actually advanced. Emits the pacemaker
-    /// timer reset and any leader/follower transition. `reset_backoff` is
-    /// set on QC-driven advances (healthy pipeline) and cleared on the
-    /// timeout path so the exponential backoff keeps growing.
-    fn enter_view(
-        &mut self,
-        new_view: ViewNumber,
-        reset_backoff: bool,
-        out: &mut Vec<Output>,
-    ) -> bool {
+    /// Returns whether the view advanced, and emits the timer reset and
+    /// any leader/follower transition. Keep timeout backoff across votes
+    /// and QCs: partial progress does not establish that the timeout is
+    /// long enough to complete the three-chain needed for a commit.
+    fn enter_view(&mut self, new_view: ViewNumber, out: &mut Vec<Output>) -> bool {
         if new_view <= self.current_view {
             return false;
         }
         self.current_view = new_view;
-        if reset_backoff {
-            self.consecutive_timeouts = 0;
-        }
         // Evict aggregation state that can no longer influence a proposal,
         // so a Byzantine peer cannot make these maps grow without bound by
         // flooding validly-formed votes/NewViews. A vote for block-view `v`
@@ -291,6 +299,18 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             return;
         }
         let high_qc = self.store.high_qc();
+        // Being the next leader after voting is not enough: wait for the
+        // previous view's QC, or a quorum of NewViews for recovery. A client
+        // request must not bypass this and fork off an older high QC.
+        if high_qc.view + 1 != self.current_view
+            && self
+                .new_views
+                .get(&self.current_view)
+                .map_or(0, HashSet::len)
+                < self.quorum()
+        {
+            return;
+        }
         let parent_height = match self.store.get_block(&high_qc.block_hash) {
             Some(p) => p.height,
             // Parent missing (no block sync in v1): we cannot extend it.
@@ -321,9 +341,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     }
 
     /// Validate a proposal and, if the SafeNode rule allows, vote on it.
-    /// Invalid or unverifiable proposals are silently ignored (logged at
-    /// debug). If the parent block is unknown we drop the proposal — there
-    /// is no block-sync protocol in v1, so we cannot fetch it.
+    /// Keep valid proposals even after their view times out: descendants
+    /// may still be certified by the other replicas. Only voting is
+    /// restricted to fresh views. Defer children until their parent arrives.
     fn handle_proposal(
         &mut self,
         from: NodeId,
@@ -339,14 +359,6 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             );
             return;
         }
-        if block.view != self.current_view {
-            tracing::debug!(
-                view = block.view,
-                current = self.current_view,
-                "hotstuff: proposal for another view, ignoring"
-            );
-            return;
-        }
         if sig.signer != from
             || !self
                 .crypto
@@ -359,47 +371,87 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             tracing::debug!("hotstuff: proposal carries an invalid justify QC, ignoring");
             return;
         }
-        if block.parent != block.justify.block_hash {
+        if block.parent != block.justify.block_hash || block.justify.view >= block.view {
             tracing::debug!("hotstuff: proposal parent does not match its justify, ignoring");
             return;
         }
-        let parent_height = match self.store.get_block(&block.parent) {
-            Some(p) => p.height,
-            None => {
-                tracing::debug!("hotstuff: proposal parent unknown, ignoring (no sync in v1)");
-                return;
+        if self.store.contains_block(&hash) {
+            return;
+        }
+        if !self.store.contains_block(&block.parent) {
+            let waiting = self.pending_proposals.entry(block.parent).or_default();
+            if !waiting.iter().any(|b| b.hash() == hash) {
+                waiting.push(block);
             }
+            return;
+        }
+        // Iterative replay also handles a whole chain delivered backwards,
+        // without unbounded recursion on the replica's stack.
+        let mut ready = std::collections::VecDeque::from([block]);
+        while let Some(block) = ready.pop_front() {
+            let hash = block.hash();
+            self.process_proposal(block, out);
+            if self.store.contains_block(&hash) {
+                if let Some(children) = self.pending_proposals.remove(&hash) {
+                    ready.extend(children);
+                }
+            }
+        }
+    }
+
+    /// Process an authenticated proposal whose parent is now available.
+    fn process_proposal(&mut self, block: Block, out: &mut Vec<Output>) {
+        let hash = block.hash();
+        let parent = match self.store.get_block(&block.parent) {
+            Some(p) => p,
+            None => return,
         };
-        if block.height != parent_height + 1 {
+        if block.height != parent.height + 1 || block.justify.view != parent.view {
             tracing::debug!("hotstuff: proposal height is not parent + 1, ignoring");
             return;
         }
 
-        // Fold the justify QC into our state (may lock/commit; never
-        // advances past the current view since it certifies an ancestor).
+        // Storage and QC learning are independent of whether we can still
+        // vote in this view. A timeout must not create a permanent hole in
+        // the local block tree. Only a QC or our pacemaker advances the
+        // view: a Byzantine future leader must not force arbitrary jumps.
+        self.store.put_block(block.clone());
         self.handle_qc(&block.justify, out);
+        // Votes/NewViews can teach us QC(block) before block itself arrives.
+        // Retry its chain rules and proposal now that the block is available.
+        let high_qc = self.store.high_qc();
+        if high_qc.block_hash == hash {
+            self.handle_qc(&high_qc, out);
+            self.propose(out);
+        }
+        if block.view > self.current_view {
+            self.future_proposals
+                .entry(block.view)
+                .or_default()
+                .push(block);
+            return;
+        }
 
         // SafeNode: vote iff the view is fresh and the block either extends
         // our locked block or carries a justify newer than our lock.
         let locked = self.store.locked_qc();
-        let safe = block.view > self.store.last_voted_view()
+        let safe = block.view == self.current_view
+            && block.view > self.store.last_voted_view()
             && (self.extends(&block, &locked.block_hash) || block.justify.view > locked.view);
         if !safe {
             return;
         }
 
-        // Persist the safety-critical vote before emitting it, then store
-        // the block so we can extend and later commit it.
+        // Persist the safety-critical vote before emitting it.
         self.store.set_last_voted_view(block.view);
-        self.store.put_block(block.clone());
         let vote_view = block.view;
         let vote_sig = PartialSig {
             signer: self.id.clone(),
             signature: self.crypto.sign(&vote_digest(vote_view, &hash)),
         };
 
-        // Voting is progress: advance the view (reset the backoff).
-        self.enter_view(vote_view + 1, true, out);
+        // Advance after voting, keeping the timeout learned by the pacemaker.
+        self.enter_view(vote_view + 1, out);
 
         // Route the vote to the next leader; a self-addressed vote is
         // collected internally rather than emitted.
@@ -511,16 +563,16 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         }
         // Enter the view on the timeout path (backoff not reset) and
         // propose; propose() self-guards against a second proposal.
-        self.enter_view(view, false, out);
+        self.enter_view(view, out);
         self.propose(out);
     }
 
     /// Pacemaker fired: abandon the current view, move to the next, and ask
     /// its leader to propose by sending a NewView carrying our high QC.
     fn handle_timeout(&mut self, out: &mut Vec<Output>) {
-        self.consecutive_timeouts += 1;
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
         let new_view = self.current_view + 1;
-        self.enter_view(new_view, false, out);
+        self.enter_view(new_view, out);
         let high_qc = self.store.high_qc();
         match self.leader_of(new_view) {
             // We lead the recovery view: count ourselves toward the NewView
@@ -567,7 +619,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             }
         }
         // Learning a QC for `qc.view` admits entering `qc.view + 1`.
-        self.enter_view(qc.view + 1, true, out);
+        self.enter_view(qc.view + 1, out);
         if fresher {
             self.propose(out);
         }
@@ -602,6 +654,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             }
         }
         self.committed_height = block.height;
+        self.consecutive_timeouts = 0;
         if !commands.is_empty() {
             out.push(Output::ApplyCommitted { commands });
         }
@@ -1238,7 +1291,7 @@ mod tests {
         assert_eq!(a.new_views.len(), 1);
 
         // Jumping well past view 5 evicts both now-useless entries.
-        a.enter_view(10, true, &mut Vec::new());
+        a.enter_view(10, &mut Vec::new());
         assert_eq!(a.votes.len(), 0, "vote round 4 is dead once past view 5");
         assert_eq!(
             a.new_views.len(),

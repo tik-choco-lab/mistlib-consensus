@@ -52,6 +52,9 @@ use web_time::Duration;
 
 enum NodeEvent {
     HotStuff(Event),
+    ViewTimeout {
+        epoch: u64,
+    },
     Propose {
         command: Vec<u8>,
         reply: oneshot::Sender<Result<u64>>,
@@ -158,6 +161,16 @@ impl<B: BlockStore + 'static, C: CryptoProvider + 'static> HotStuffNode<B, C> {
                 };
                 match event {
                     NodeEvent::Shutdown => break,
+                    NodeEvent::ViewTimeout { epoch } => {
+                        // Verification can occupy this loop while the old
+                        // timer queues its event. Recheck after dequeue:
+                        // a preceding event may have advanced the view.
+                        if this.view_epoch.load(Ordering::SeqCst) != epoch {
+                            continue;
+                        }
+                        let outputs = state.step(Event::ViewTimeout);
+                        this.handle_outputs(&state, outputs, None).await;
+                    }
                     NodeEvent::Propose { command, reply } => {
                         let outputs = state.step(Event::ClientPropose { command });
                         this.handle_outputs(&state, outputs, Some(reply)).await;
@@ -247,7 +260,8 @@ impl<B: BlockStore + 'static, C: CryptoProvider + 'static> HotStuffNode<B, C> {
     /// (Re)arms the single view timer. Unlike Raft's fixed-cadence
     /// timers, the duration changes per view, so each reset bumps the
     /// epoch and spawns a fresh one-shot sleeper; stale sleepers observe
-    /// the changed epoch and silently drop their `ViewTimeout`.
+    /// the changed epoch and silently drop their `ViewTimeout`. Queued
+    /// timeouts carry the epoch so the event loop can also discard them.
     fn arm_view_timer(self: &Arc<Self>, duration_ms: u64) {
         let epoch = self.view_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let this = Arc::clone(self);
@@ -258,7 +272,7 @@ impl<B: BlockStore + 'static, C: CryptoProvider + 'static> HotStuffNode<B, C> {
                 return;
             }
             if this.view_epoch.load(Ordering::SeqCst) == epoch {
-                let _ = this.events_tx.send(NodeEvent::HotStuff(Event::ViewTimeout));
+                let _ = this.events_tx.send(NodeEvent::ViewTimeout { epoch });
             }
         }));
     }
@@ -337,5 +351,84 @@ impl<B: BlockStore + 'static, C: CryptoProvider + 'static> HotStuffNode<B, C> {
 
     pub fn shutdown(&self) {
         let _ = self.events_tx.send(NodeEvent::Shutdown);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::hotstuff::{Block, MemoryBlockStore, NoopCrypto, PartialSig, QuorumCert};
+    use async_trait::async_trait;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct Runtime(tokio::runtime::Handle);
+
+    #[async_trait]
+    impl AsyncRuntime for Runtime {
+        fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
+            self.0.spawn(future);
+        }
+
+        async fn sleep(&self, duration: Duration) {
+            tokio::time::sleep(duration).await;
+        }
+    }
+
+    struct Transport;
+
+    #[async_trait]
+    impl HotStuffTransport for Transport {
+        async fn send(&self, _to: &NodeId, _msg: HotStuffMessage) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_timeout_cannot_expire_a_newer_view() {
+        let id = |s: &str| NodeId(s.into());
+        let node = HotStuffNode::new(
+            id("a"),
+            vec![id("b"), id("c"), id("d")],
+            PacemakerConfig::default(),
+            Arc::new(Runtime(tokio::runtime::Handle::current())),
+            Arc::new(Transport),
+            MemoryBlockStore::new(),
+            NoopCrypto,
+        );
+        node.start();
+        // No task runs until we await. Bootstrap arms epoch 1; processing
+        // this proposal advances to view 2 and arms epoch 2. Model the old
+        // timer having queued its timeout during proposal verification.
+        node.deliver(
+            id("b"),
+            HotStuffMessage::Proposal {
+                block: Block {
+                    parent: Block::genesis().hash(),
+                    view: 1,
+                    height: 1,
+                    commands: vec![],
+                    justify: QuorumCert::genesis(),
+                },
+                sig: PartialSig {
+                    signer: id("b"),
+                    signature: vec![],
+                },
+            },
+        );
+        node.events_tx
+            .send(NodeEvent::ViewTimeout { epoch: 1 })
+            .unwrap();
+        // A proposal reply is a barrier after all previously queued events.
+        assert!(matches!(node.propose(vec![]).await,
+            Err(RaftError::NotLeader { leader_hint: Some(h) }) if h == id("c")));
+
+        // A timeout for the active epoch must still advance the view.
+        node.events_tx
+            .send(NodeEvent::ViewTimeout { epoch: 2 })
+            .unwrap();
+        assert!(matches!(node.propose(vec![]).await,
+            Err(RaftError::NotLeader { leader_hint: Some(h) }) if h == id("d")));
+        node.shutdown();
     }
 }

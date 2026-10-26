@@ -54,18 +54,25 @@ Per-replica state: `current_view`, `high_qc` (highest QC seen),
 `committed_height`, pending command queue (leader side).
 
 On `Proposal { block, sig }` from `from`:
-1. Verify `from == leader(block.view)`, `block.view == current_view`,
-   leader sig over `proposal_digest(view, block.hash())`, and
-   `block.justify` QC validity. Verify `block.parent == block.justify.block_hash`
-   and `block.height == parent.height + 1`. Reject (ignore) otherwise.
-2. Process `block.justify` as a QC (see "On QC" below).
-3. **Voting rule** (SafeNode): vote iff `block.view > last_voted_view` AND
-   (`block` extends `locked_qc.block_hash` OR
-   `block.justify.view > locked_qc.view`).
-   If voting: set `last_voted_view = block.view`, store block, send
-   `Vote` to `leader(block.view + 1)` (pipelined: next leader collects).
-4. Advance view to `block.view + 1` after voting (QC-driven advance
-   happens via step 2 as well; view only moves forward, never back).
+1. Verify `from == leader(block.view)`, the leader signature, and
+   `block.justify` QC validity. Require `block.parent == block.justify.block_hash`
+   and `block.justify.view < block.view`.
+2. If the parent has not arrived, defer the authenticated proposal until
+   it does. Then require `block.height == parent.height + 1` and
+   `block.justify.view == parent.view`, and store the block, including
+   proposals whose views have already timed out. Replay deferred children
+   whenever their parent becomes available.
+3. Process its justify as a QC, advancing to `justify.view + 1` if ahead.
+   If we already learned a QC for this block before receiving it, retry
+   that QC's lock/commit rules and any proposal waiting to extend it.
+   Retain recovery proposals for a future view until the local pacemaker
+   or a QC reaches that view. A leader signature alone cannot skip views.
+4. **Voting rule** (SafeNode): vote iff `block.view == current_view`,
+   `block.view > last_voted_view`, AND (`block` extends the locked block OR
+   `block.justify.view > locked_qc.view`). Persist `last_voted_view` before
+   sending `Vote` to `leader(block.view + 1)`. Late storage never causes
+   a vote in a view the replica has left.
+5. Advance to `block.view + 1` after voting. View numbers only increase.
 
 On `Vote` (as leader of `vote.view + 1`): collect distinct-signer votes
 for `(view, block_hash)`; at `quorum`, assemble `QuorumCert`, update
@@ -87,20 +94,27 @@ and `view >= current_view`, count distinct senders; on `quorum` NewViews
 
 On `ViewTimeout`: `current_view += 1`, send `NewView(current_view, high_qc)`
 to `leader(current_view)`, emit `ResetViewTimer` with exponential backoff
-(`base * 2^consecutive_timeouts`, capped). Reset backoff whenever a QC
-advances the view.
+(`base * 2^consecutive_timeouts`, capped). Retain backoff across votes
+and QCs; reset it when the three-chain commits a newer block. Partial
+progress must not repeatedly shrink the timeout below the time needed
+for a complete commit chain. The async driver tags timeout events with
+an epoch and checks it both before enqueueing and when consuming them,
+so a timeout queued during verification cannot expire a newer view.
 
 Proposing (leader of `current_view`, once per view): block extends
 `high_qc.block_hash` with `justify = high_qc`, drains the pending command
 queue (empty blocks are allowed and REQUIRED for pipeline progress —
-leader proposes even with no pending commands). Broadcast `Proposal` to
-all validators (including processing it locally as a replica).
+leader proposes even with no pending commands). A proposal requires either
+`high_qc.view + 1 == current_view` or a quorum of NewViews for this view;
+a client request only queues its command until that condition holds.
+Broadcast `Proposal` to all validators (including processing it locally as a replica).
 
-`ClientPropose`: if leader of current view and not yet proposed → queue
-and propose. If not leader → `ProposeRejected { leader_hint: leader(current_view) }`.
-Queued commands ride in the next block this node leads.
-`Proposed { sequence }` is emitted when the command is included in a
-block (sequence = tentative; commit is signalled via the committed stream).
+`ClientPropose`: if leader of the current view, queue the command and
+propose once authorized by a QC or NewView quorum, at most once per view.
+Otherwise emit `ProposeRejected { leader_hint: leader(current_view) }`.
+`Proposed { view }` acknowledges acceptance into the queue for a block at
+or after `view`. The execution sequence is assigned at commit and reported
+via the committed stream.
 
 ### Crypto (`hotstuff/crypto.rs`)
 
@@ -148,10 +162,13 @@ Additive variants on `RaftError` (kept name for compatibility, alias
 
 ### Known limitations (v1)
 
-- **No block-sync protocol**: a replica that misses a proposal whose
-  parent it never stored ignores descendants until the pacemaker path
-  catches it up via NewView/high_qc. Fine over ReliableOrdered links;
-  a fetch-missing-ancestors protocol is future work.
+- **No block-sync protocol**: delayed proposals and descendants delivered
+  out of order are retained and replayed when their parents arrive. A
+  permanently missing proposal still needs a fetch-missing-ancestors
+  protocol; NewView/high_qc carries certificates, not block contents.
+  Reliable ordering on each sender's link does not order proposals from
+  successive leaders. Deferred proposals and the block tree have no
+  retention limit yet; flow control and pruning remain future work.
 - **Membership is operator-trusted** (see above); no BFT reconfiguration.
 - **QC size is O(n)** (vector of Ed25519 sigs); threshold/BLS
   aggregation is future work.

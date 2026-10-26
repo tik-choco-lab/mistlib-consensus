@@ -63,13 +63,7 @@ struct Router(Arc<RouterInner>);
 struct RouterInner {
     routes: Mutex<HashMap<NodeId, mpsc::UnboundedSender<(NodeId, HotStuffMessage)>>>,
     dropped: Mutex<HashSet<NodeId>>,
-    /// A small, uniform per-hop latency. Without it the in-memory pipeline
-    /// free-runs at thousands of views/sec and, because a quorum is only
-    /// 3-of-4, the consistently-slowest node is left out of every QC and
-    /// falls permanently behind (v1 has no block sync to recover it). A
-    /// few ms makes the vote round-trip (~2 hops) dominate task-scheduling
-    /// jitter, so a proposal for view v+1 never outruns the votes for view
-    /// v and all four nodes advance in lockstep.
+    /// A small per-hop latency to model an asynchronous network.
     hop_latency: Duration,
 }
 
@@ -676,10 +670,40 @@ async fn mode_facade_smoke() {
 // sans-IO unit tests.
 // ==================================================================
 
-type Ed25519Node = HotStuffNode<MemoryBlockStore, Ed25519Crypto>;
+/// Preserve real verification while making its CPU cost exceed the short
+/// test pacemaker's base timeout on every machine. The delay models debug
+/// signature work on a slower CPU without changing the protocol deadlines.
+struct DelayedCrypto {
+    inner: Ed25519Crypto,
+    verify_delay: StdDuration,
+}
+
+impl CryptoProvider for DelayedCrypto {
+    fn sign(&self, digest: &[u8; 32]) -> Vec<u8> {
+        self.inner.sign(digest)
+    }
+
+    fn verify(&self, signer: &NodeId, digest: &[u8; 32], sig: &[u8]) -> bool {
+        if !self.verify_delay.is_zero() {
+            std::thread::sleep(self.verify_delay);
+        }
+        self.inner.verify(signer, digest, sig)
+    }
+}
+
+type Ed25519Node = HotStuffNode<MemoryBlockStore, DelayedCrypto>;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn untrusted_mode_with_real_signatures() {
+    signed_cluster(StdDuration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn untrusted_mode_with_slow_real_signatures() {
+    signed_cluster(StdDuration::from_millis(25)).await;
+}
+
+async fn signed_cluster(verify_delay: StdDuration) {
     let ids: Vec<NodeId> = ["n1", "n2", "n3", "n4"].iter().map(|s| nid(s)).collect();
 
     // One keypair per validator; the registry of verifying keys is shared
@@ -698,7 +722,10 @@ async fn untrusted_mode_with_real_signatures() {
     let mut nodes: HashMap<NodeId, Arc<Ed25519Node>> = HashMap::new();
     for id in &ids {
         let peers: Vec<NodeId> = ids.iter().filter(|p| *p != id).cloned().collect();
-        let crypto = Ed25519Crypto::new(signing_keys[id].clone(), registry.clone());
+        let crypto = DelayedCrypto {
+            inner: Ed25519Crypto::new(signing_keys[id].clone(), registry.clone()),
+            verify_delay,
+        };
         let node = HotStuffNode::new(
             id.clone(),
             peers,
