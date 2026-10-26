@@ -944,10 +944,10 @@ impl<S: RaftStorage> RaftState<S> {
                 if self.role != Role::Leader || term != self.current_term() || !success {
                     return;
                 }
-                if !self
+                if self
                     .storage
                     .snapshot()
-                    .is_some_and(|s| s.last_included_index == last_included_index)
+                    .is_none_or(|s| s.last_included_index != last_included_index)
                 {
                     return;
                 }
