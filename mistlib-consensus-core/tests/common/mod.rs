@@ -6,8 +6,8 @@
 
 use async_trait::async_trait;
 use mistlib_consensus_core::{
-    LogEntry, MemoryStorage, NodeId, RaftConfig, RaftMessage, RaftNode, RaftStorage,
-    RaftTransport, Role,
+    LogEntry, MemoryStorage, NodeId, RaftConfig, RaftMessage, RaftNode, RaftStorage, RaftTransport,
+    Role,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -58,7 +58,12 @@ struct NetworkInner {
 impl Network {
     /// Creates a network for the given node ids and returns it along with
     /// each node's inbound receiver (to be passed to `attach_inbound`).
-    pub fn new(ids: &[NodeId]) -> (Self, HashMap<NodeId, mpsc::UnboundedReceiver<(NodeId, RaftMessage)>>) {
+    pub fn new(
+        ids: &[NodeId],
+    ) -> (
+        Self,
+        HashMap<NodeId, mpsc::UnboundedReceiver<(NodeId, RaftMessage)>>,
+    ) {
         let mut routes = HashMap::new();
         let mut rxs = HashMap::new();
         let mut groups = HashMap::new();
@@ -109,7 +114,10 @@ impl Network {
     }
 
     pub fn transport_for(&self, from: NodeId) -> Arc<dyn RaftTransport> {
-        Arc::new(NetTransport { net: self.clone(), from })
+        Arc::new(NetTransport {
+            net: self.clone(),
+            from,
+        })
     }
 }
 

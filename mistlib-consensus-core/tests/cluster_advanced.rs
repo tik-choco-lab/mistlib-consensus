@@ -51,9 +51,15 @@ async fn leader_failover_elects_new_leader_and_keeps_committing() {
     let leader_id = wait_for_leader_among(&nodes, &all, timeout).await;
 
     for i in 0..3u8 {
-        nodes[&leader_id].propose(vec![i]).await.expect("propose should succeed");
+        nodes[&leader_id]
+            .propose(vec![i])
+            .await
+            .expect("propose should succeed");
     }
-    wait_for(timeout, || (applied[&leader_id].lock().unwrap().len() >= 3).then_some(())).await;
+    wait_for(timeout, || {
+        (applied[&leader_id].lock().unwrap().len() >= 3).then_some(())
+    })
+    .await;
     assert_logs_consistent(&applied);
 
     // Kill the leader: remove it from the network and stop its event loop.
@@ -65,10 +71,16 @@ async fn leader_failover_elects_new_leader_and_keeps_committing() {
     assert_ne!(new_leader_id, leader_id, "a survivor must take over");
 
     for i in 10..13u8 {
-        nodes[&new_leader_id].propose(vec![i]).await.expect("new leader must accept proposals");
+        nodes[&new_leader_id]
+            .propose(vec![i])
+            .await
+            .expect("new leader must accept proposals");
     }
     for id in &survivors {
-        wait_for(timeout, || (applied[id].lock().unwrap().len() >= 6).then_some(())).await;
+        wait_for(timeout, || {
+            (applied[id].lock().unwrap().len() >= 6).then_some(())
+        })
+        .await;
     }
 
     let survivor_applied: HashMap<NodeId, _> = applied
@@ -124,9 +136,15 @@ async fn partition_minority_cannot_commit_majority_progresses_and_heals() {
 
     let timeout = StdDuration::from_secs(5);
     let leader_id = wait_for_leader_among(&nodes, &all, timeout).await;
-    nodes[&leader_id].propose(vec![0]).await.expect("initial propose should commit");
+    nodes[&leader_id]
+        .propose(vec![0])
+        .await
+        .expect("initial propose should commit");
     for id in &all {
-        wait_for(timeout, || (!applied[id].lock().unwrap().is_empty()).then_some(())).await;
+        wait_for(timeout, || {
+            (!applied[id].lock().unwrap().is_empty()).then_some(())
+        })
+        .await;
     }
     assert_logs_consistent(&applied);
 
@@ -134,7 +152,11 @@ async fn partition_minority_cannot_commit_majority_progresses_and_heals() {
     // the remaining 3 stay in group 0 (the majority).
     let minority_peer = all.iter().find(|id| **id != leader_id).unwrap().clone();
     let minority: Vec<NodeId> = vec![leader_id.clone(), minority_peer];
-    let majority: Vec<NodeId> = all.iter().filter(|id| !minority.contains(id)).cloned().collect();
+    let majority: Vec<NodeId> = all
+        .iter()
+        .filter(|id| !minority.contains(id))
+        .cloned()
+        .collect();
     for id in &minority {
         net.set_group(id, 1);
     }
@@ -161,10 +183,16 @@ async fn partition_minority_cannot_commit_majority_progresses_and_heals() {
     let new_leader_id = wait_for_leader_among(&nodes, &majority, timeout).await;
     assert!(majority.contains(&new_leader_id));
     for i in 1..4u8 {
-        nodes[&new_leader_id].propose(vec![i]).await.expect("majority leader must commit");
+        nodes[&new_leader_id]
+            .propose(vec![i])
+            .await
+            .expect("majority leader must commit");
     }
     for id in &majority {
-        wait_for(timeout, || (applied[id].lock().unwrap().len() >= 4).then_some(())).await;
+        wait_for(timeout, || {
+            (applied[id].lock().unwrap().len() >= 4).then_some(())
+        })
+        .await;
     }
     let majority_applied: HashMap<NodeId, _> = applied
         .iter()
@@ -181,9 +209,15 @@ async fn partition_minority_cannot_commit_majority_progresses_and_heals() {
     // higher term from the new leader) and converge onto the majority's
     // committed log, with no divergence anywhere in the overlap.
     net.heal(&minority);
-    wait_for(timeout, || (nodes[&leader_id].role() != Some(Role::Leader)).then_some(())).await;
+    wait_for(timeout, || {
+        (nodes[&leader_id].role() != Some(Role::Leader)).then_some(())
+    })
+    .await;
     for id in &all {
-        wait_for(timeout, || (applied[id].lock().unwrap().len() >= 4).then_some(())).await;
+        wait_for(timeout, || {
+            (applied[id].lock().unwrap().len() >= 4).then_some(())
+        })
+        .await;
     }
     assert_logs_consistent(&applied);
 
@@ -228,10 +262,16 @@ async fn restart_reusing_same_storage_rejoins_without_double_apply() {
     let timeout = StdDuration::from_secs(5);
     let leader_id = wait_for_leader_among(&nodes, &all, timeout).await;
     for i in 0..3u8 {
-        nodes[&leader_id].propose(vec![i]).await.expect("propose should succeed");
+        nodes[&leader_id]
+            .propose(vec![i])
+            .await
+            .expect("propose should succeed");
     }
     for id in &all {
-        wait_for(timeout, || (applied[id].lock().unwrap().len() >= 3).then_some(())).await;
+        wait_for(timeout, || {
+            (applied[id].lock().unwrap().len() >= 3).then_some(())
+        })
+        .await;
     }
     assert_logs_consistent(&applied);
 
@@ -249,18 +289,36 @@ async fn restart_reusing_same_storage_rejoins_without_double_apply() {
     net.kill(&follower_id);
     nodes[&follower_id].shutdown();
     for i in 10..13u8 {
-        nodes[&leader_id].propose(vec![i]).await.expect("propose should succeed while follower is down");
+        nodes[&leader_id]
+            .propose(vec![i])
+            .await
+            .expect("propose should succeed while follower is down");
     }
-    let remaining: Vec<NodeId> = all.iter().filter(|id| **id != follower_id).cloned().collect();
+    let remaining: Vec<NodeId> = all
+        .iter()
+        .filter(|id| **id != follower_id)
+        .cloned()
+        .collect();
     for id in &remaining {
-        wait_for(timeout, || (applied[id].lock().unwrap().len() >= 6).then_some(())).await;
+        wait_for(timeout, || {
+            (applied[id].lock().unwrap().len() >= 6).then_some(())
+        })
+        .await;
     }
 
     // "Restart": build a brand-new RaftNode for the same id, reusing the
     // very same SharedMemoryStorage instance (same Arc, same data).
     let same_storage = storages[&follower_id].clone();
-    assert_eq!(same_storage.current_term(), term_before, "term must have persisted");
-    assert_eq!(same_storage.voted_for(), voted_for_before, "vote must have persisted");
+    assert_eq!(
+        same_storage.current_term(),
+        term_before,
+        "term must have persisted"
+    );
+    assert_eq!(
+        same_storage.voted_for(),
+        voted_for_before,
+        "vote must have persisted"
+    );
 
     let revived_rx = net.revive(&follower_id);
     let peers: Vec<NodeId> = all.iter().filter(|p| **p != follower_id).cloned().collect();
@@ -276,12 +334,19 @@ async fn restart_reusing_same_storage_rejoins_without_double_apply() {
     nodes.insert(follower_id.clone(), revived_node);
     applied.insert(follower_id.clone(), revived_applied);
 
-    wait_for(timeout, || (applied[&follower_id].lock().unwrap().len() >= 6).then_some(())).await;
+    wait_for(timeout, || {
+        (applied[&follower_id].lock().unwrap().len() >= 6).then_some(())
+    })
+    .await;
     assert_logs_consistent(&applied);
 
     // No double-apply: exactly 6 entries applied, each exactly once.
     let follower_log = applied[&follower_id].lock().unwrap().clone();
-    assert_eq!(follower_log.len(), 6, "must not double-apply already-committed entries");
+    assert_eq!(
+        follower_log.len(),
+        6,
+        "must not double-apply already-committed entries"
+    );
     let mut indices: Vec<u64> = follower_log.iter().map(|e| e.index).collect();
     let dedup_len = {
         indices.sort_unstable();
@@ -362,14 +427,21 @@ async fn randomized_stress_all_nodes_converge_on_identical_log() {
     let reference = applied[&all[0]].lock().unwrap().clone();
     for id in &all {
         let log = applied[id].lock().unwrap();
-        assert_eq!(log.len(), proposed_commands.len(), "node {id:?} has the wrong number of applied entries");
+        assert_eq!(
+            log.len(),
+            proposed_commands.len(),
+            "node {id:?} has the wrong number of applied entries"
+        );
         assert_eq!(*log, reference, "node {id:?} diverged");
     }
     let mut applied_commands: Vec<Vec<u8>> = reference.iter().map(|e| e.command.clone()).collect();
     applied_commands.sort();
     let mut expected = proposed_commands.clone();
     expected.sort();
-    assert_eq!(applied_commands, expected, "every proposed command must appear exactly once");
+    assert_eq!(
+        applied_commands, expected,
+        "every proposed command must appear exactly once"
+    );
 
     for id in &all {
         nodes[id].shutdown();

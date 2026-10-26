@@ -99,7 +99,10 @@ impl Router {
     }
 
     fn transport_for(&self, from: NodeId) -> Arc<dyn HotStuffTransport> {
-        Arc::new(RouterTransport { router: self.clone(), from })
+        Arc::new(RouterTransport {
+            router: self.clone(),
+            from,
+        })
     }
 }
 
@@ -147,7 +150,10 @@ fn nid(s: &str) -> NodeId {
 /// Short pacemaker timeouts keep the tests quick while leaving enough
 /// slack for the in-memory round-trips.
 fn pacemaker() -> PacemakerConfig {
-    PacemakerConfig { base_timeout_ms: 150, max_timeout_ms: 2_000 }
+    PacemakerConfig {
+        base_timeout_ms: 150,
+        max_timeout_ms: 2_000,
+    }
 }
 
 /// Builds and starts `ids` as a fully-connected NoopCrypto cluster.
@@ -299,7 +305,10 @@ async fn collect_committed(
         let cmd = tokio::time::timeout(timeout, rx.recv())
             .await
             .unwrap_or_else(|_| {
-                panic!("node {id:?} timed out waiting for {n} commits (had {})", got.len())
+                panic!(
+                    "node {id:?} timed out waiting for {n} commits (had {})",
+                    got.len()
+                )
             })
             .expect("committed channel closed unexpectedly");
         got.push(cmd);
@@ -328,8 +337,10 @@ async fn four_node_cluster_commits_proposals() {
     // gapless sequences — not agreement with proposal order, since a
     // leader that has already proposed its view queues our command for a
     // later block it leads.
-    let mut committed: HashMap<NodeId, broadcast::Receiver<CommittedCommand>> =
-        nodes.iter().map(|(id, n)| (id.clone(), n.subscribe_committed())).collect();
+    let mut committed: HashMap<NodeId, broadcast::Receiver<CommittedCommand>> = nodes
+        .iter()
+        .map(|(id, n)| (id.clone(), n.subscribe_committed()))
+        .collect();
     let seen = watch_committed(&nodes[&ids[0]], &runtime);
 
     // Inject three distinct commands, each confirmed committed before the
@@ -343,7 +354,10 @@ async fn four_node_cluster_commits_proposals() {
     let mut per_node: HashMap<NodeId, Vec<CommittedCommand>> = HashMap::new();
     for id in &ids {
         let rx = committed.get_mut(id).unwrap();
-        per_node.insert(id.clone(), collect_committed(id, rx, 3, StdDuration::from_secs(15)).await);
+        per_node.insert(
+            id.clone(),
+            collect_committed(id, rx, 3, StdDuration::from_secs(15)).await,
+        );
     }
 
     // Every node agrees on the exact committed sequence.
@@ -354,9 +368,15 @@ async fn four_node_cluster_commits_proposals() {
     payloads.sort();
     let mut expected = commands.clone();
     expected.sort();
-    assert_eq!(payloads, expected, "all three commands present exactly once");
+    assert_eq!(
+        payloads, expected,
+        "all three commands present exactly once"
+    );
     for id in &ids[1..] {
-        assert_eq!(&per_node[id], reference, "node {id:?} disagrees on the committed order");
+        assert_eq!(
+            &per_node[id], reference,
+            "node {id:?} disagrees on the committed order"
+        );
     }
 
     for n in nodes.values() {
@@ -391,7 +411,9 @@ async fn non_leader_propose_rejected_with_hint() {
             let follower = ids.iter().find(|id| !nodes[*id].is_leader()).cloned();
             if let Some(follower) = follower {
                 match nodes[&follower].propose(b"nope".to_vec()).await {
-                    Err(RaftError::NotLeader { leader_hint: Some(h) }) => {
+                    Err(RaftError::NotLeader {
+                        leader_hint: Some(h),
+                    }) => {
                         assert!(ids.contains(&h), "hint {h:?} is not a validator");
                         assert_ne!(h, follower, "a follower must not name itself as leader");
                         return h;
@@ -411,7 +433,10 @@ async fn non_leader_propose_rejected_with_hint() {
 
     // The hint identifies a real leader: that node is observed leading a
     // view within a rotation (round-robin cycles leadership to it).
-    let _ = wait_for(StdDuration::from_secs(5), || nodes[&hint].is_leader().then_some(())).await;
+    let _ = wait_for(StdDuration::from_secs(5), || {
+        nodes[&hint].is_leader().then_some(())
+    })
+    .await;
 
     for n in nodes.values() {
         n.shutdown();
@@ -451,7 +476,10 @@ async fn observe_leader_hints(node: &Arc<HsNode>, window: StdDuration) -> HashSe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_survives_leader_silence() {
-    let ids: Vec<NodeId> = ["n1", "n2", "n3", "n4", "n5"].iter().map(|s| nid(s)).collect();
+    let ids: Vec<NodeId> = ["n1", "n2", "n3", "n4", "n5"]
+        .iter()
+        .map(|s| nid(s))
+        .collect();
     let (router, rxs) = Router::new(&ids);
     let runtime = test_runtime();
     let nodes = spawn_cluster(&ids, &router, rxs, &runtime);
@@ -488,12 +516,22 @@ async fn cluster_survives_leader_silence() {
         .map(|id| (id.clone(), nodes[id].subscribe_committed()))
         .collect();
     let cmd = b"after-silence".to_vec();
-    commit_command(&nodes, &survivors, cmd.clone(), &seen, StdDuration::from_secs(30)).await;
+    commit_command(
+        &nodes,
+        &survivors,
+        cmd.clone(),
+        &seen,
+        StdDuration::from_secs(30),
+    )
+    .await;
 
     for id in &survivors {
         let rx = committed.get_mut(id).unwrap();
         let got = collect_committed(id, rx, 1, StdDuration::from_secs(20)).await;
-        assert_eq!(got[0].command, cmd, "survivor {id:?} committed the wrong command");
+        assert_eq!(
+            got[0].command, cmd,
+            "survivor {id:?} committed the wrong command"
+        );
     }
 
     for n in nodes.values() {
@@ -535,7 +573,10 @@ async fn mode_facade_smoke() {
     let hs_node = HotStuffNode::new(
         hs_id.clone(),
         vec![],
-        PacemakerConfig { base_timeout_ms: 5_000, max_timeout_ms: 8_000 },
+        PacemakerConfig {
+            base_timeout_ms: 5_000,
+            max_timeout_ms: 8_000,
+        },
         Arc::clone(&runtime),
         hs_router.transport_for(hs_id.clone()),
         MemoryBlockStore::new(),
@@ -552,7 +593,11 @@ async fn mode_facade_smoke() {
     let raft_node = RaftNode::new(
         raft_id.clone(),
         vec![],
-        RaftConfig { election_timeout_min_ms: 60, election_timeout_max_ms: 120, heartbeat_interval_ms: 20 },
+        RaftConfig {
+            election_timeout_min_ms: 60,
+            election_timeout_max_ms: 120,
+            heartbeat_interval_ms: 20,
+        },
         Arc::clone(&runtime),
         Arc::new(NullRaftTransport),
         MemoryStorage::new(),
@@ -572,19 +617,31 @@ async fn mode_facade_smoke() {
     let mut raft_rx = trusted.subscribe_committed(&runtime);
 
     // Trusted path: one propose commits (single-node Raft).
-    let _ = wait_for(StdDuration::from_secs(5), || trusted.is_leader().then_some(())).await;
+    let _ = wait_for(StdDuration::from_secs(5), || {
+        trusted.is_leader().then_some(())
+    })
+    .await;
     let raft_cmd = b"raft-payload".to_vec();
-    trusted.propose(raft_cmd.clone()).await.expect("single-node raft propose should succeed");
+    trusted
+        .propose(raft_cmd.clone())
+        .await
+        .expect("single-node raft propose should succeed");
     let raft_committed = tokio::time::timeout(StdDuration::from_secs(5), raft_rx.recv())
         .await
         .expect("raft commit timed out")
         .expect("raft committed stream closed");
-    assert_eq!(raft_committed.command, raft_cmd, "trusted facade committed wrong payload");
+    assert_eq!(
+        raft_committed.command, raft_cmd,
+        "trusted facade committed wrong payload"
+    );
 
     // Untrusted path: propose the target, then feed fillers until it
     // commits (the first committed command must be our target).
     let hs_cmd = b"hotstuff-payload".to_vec();
-    untrusted.propose(hs_cmd.clone()).await.expect("solo hotstuff propose should succeed");
+    untrusted
+        .propose(hs_cmd.clone())
+        .await
+        .expect("solo hotstuff propose should succeed");
     let hs_committed = tokio::time::timeout(StdDuration::from_secs(15), async {
         loop {
             // Try to observe the commit; feed a filler if it hasn't landed.
@@ -598,8 +655,14 @@ async fn mode_facade_smoke() {
     })
     .await
     .expect("hotstuff commit timed out");
-    assert_eq!(hs_committed.command, hs_cmd, "untrusted facade committed wrong payload");
-    assert_eq!(hs_committed.sequence, 1, "target is the first committed command");
+    assert_eq!(
+        hs_committed.command, hs_cmd,
+        "untrusted facade committed wrong payload"
+    );
+    assert_eq!(
+        hs_committed.sequence, 1,
+        "target is the first committed command"
+    );
 
     untrusted.shutdown();
     trusted.shutdown();
@@ -621,10 +684,14 @@ async fn untrusted_mode_with_real_signatures() {
 
     // One keypair per validator; the registry of verifying keys is shared
     // by all nodes (key distribution is out of scope for the engine).
-    let signing_keys: HashMap<NodeId, SigningKey> =
-        ids.iter().map(|id| (id.clone(), SigningKey::generate(&mut OsRng))).collect();
-    let registry: HashMap<NodeId, _> =
-        signing_keys.iter().map(|(id, sk)| (id.clone(), sk.verifying_key())).collect();
+    let signing_keys: HashMap<NodeId, SigningKey> = ids
+        .iter()
+        .map(|id| (id.clone(), SigningKey::generate(&mut OsRng)))
+        .collect();
+    let registry: HashMap<NodeId, _> = signing_keys
+        .iter()
+        .map(|(id, sk)| (id.clone(), sk.verifying_key()))
+        .collect();
 
     let (router, mut rxs) = Router::new(&ids);
     let runtime = test_runtime();
@@ -649,8 +716,10 @@ async fn untrusted_mode_with_real_signatures() {
     let _ = wait_for(StdDuration::from_secs(5), || current_leader(&nodes, &ids)).await;
 
     let seen = watch_committed(&nodes[&ids[0]], &runtime);
-    let mut committed: HashMap<NodeId, broadcast::Receiver<CommittedCommand>> =
-        ids.iter().map(|id| (id.clone(), nodes[id].subscribe_committed())).collect();
+    let mut committed: HashMap<NodeId, broadcast::Receiver<CommittedCommand>> = ids
+        .iter()
+        .map(|id| (id.clone(), nodes[id].subscribe_committed()))
+        .collect();
 
     let cmd = b"signed-command".to_vec();
     commit_command(&nodes, &ids, cmd.clone(), &seen, StdDuration::from_secs(20)).await;
@@ -658,7 +727,10 @@ async fn untrusted_mode_with_real_signatures() {
     for id in &ids {
         let rx = committed.get_mut(id).unwrap();
         let got = collect_committed(id, rx, 1, StdDuration::from_secs(15)).await;
-        assert_eq!(got[0].command, cmd, "node {id:?} committed the wrong command");
+        assert_eq!(
+            got[0].command, cmd,
+            "node {id:?} committed the wrong command"
+        );
     }
 
     for n in nodes.values() {

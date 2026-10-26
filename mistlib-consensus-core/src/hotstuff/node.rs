@@ -294,7 +294,10 @@ impl<B: BlockStore + 'static, C: CryptoProvider + 'static> HotStuffNode<B, C> {
     pub async fn propose(&self, command: Vec<u8>) -> Result<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.events_tx
-            .send(NodeEvent::Propose { command, reply: reply_tx })
+            .send(NodeEvent::Propose {
+                command,
+                reply: reply_tx,
+            })
             .map_err(|_| RaftError::ShuttingDown)?;
         reply_rx.await.map_err(|_| RaftError::ChannelClosed)?
     }

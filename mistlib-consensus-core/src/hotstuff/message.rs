@@ -46,7 +46,11 @@ pub struct QuorumCert {
 impl QuorumCert {
     /// The genesis certificate justifying the genesis block.
     pub fn genesis() -> Self {
-        Self { view: 0, block_hash: Block::genesis().hash(), signatures: Vec::new() }
+        Self {
+            view: 0,
+            block_hash: Block::genesis().hash(),
+            signatures: Vec::new(),
+        }
     }
 }
 
@@ -74,7 +78,11 @@ impl Block {
             view: 0,
             height: 0,
             commands: Vec::new(),
-            justify: QuorumCert { view: 0, block_hash: BlockHash::ZERO, signatures: Vec::new() },
+            justify: QuorumCert {
+                view: 0,
+                block_hash: BlockHash::ZERO,
+                signatures: Vec::new(),
+            },
         }
     }
 
@@ -123,11 +131,18 @@ pub enum HotStuffMessage {
     Proposal { block: Block, sig: PartialSig },
     /// A replica's vote, signed over [`vote_digest`], sent to the
     /// leader of `view + 1` (who aggregates it into the next QC).
-    Vote { view: ViewNumber, block_hash: BlockHash, sig: PartialSig },
+    Vote {
+        view: ViewNumber,
+        block_hash: BlockHash,
+        sig: PartialSig,
+    },
     /// Sent to the leader of `view` on timeout so it can propose while
     /// extending the highest QC known to the quorum. Unsigned: the QC
     /// inside self-certifies, and NewView cannot affect safety.
-    NewView { view: ViewNumber, high_qc: QuorumCert },
+    NewView {
+        view: ViewNumber,
+        high_qc: QuorumCert,
+    },
 }
 
 impl HotStuffMessage {

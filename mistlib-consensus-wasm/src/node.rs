@@ -57,13 +57,15 @@ impl WasmRaftNode {
     /// (`electionTimeoutMinMs`, `electionTimeoutMaxMs`,
     /// `heartbeatIntervalMs`); pass `null`/omit to use defaults.
     #[wasm_bindgen(constructor)]
-    pub fn new(node_id: String, peers_json: String, config_json: Option<String>) -> Result<WasmRaftNode, JsError> {
+    pub fn new(
+        node_id: String,
+        peers_json: String,
+        config_json: Option<String>,
+    ) -> Result<WasmRaftNode, JsError> {
         let peers: Vec<String> = serde_json::from_str(&peers_json)?;
         let peers: Vec<NodeId> = peers.into_iter().map(NodeId).collect();
         let config: RaftConfig = match config_json {
-            Some(json) if !json.is_empty() => {
-                serde_json::from_str::<WasmRaftConfig>(&json)?.into()
-            }
+            Some(json) if !json.is_empty() => serde_json::from_str::<WasmRaftConfig>(&json)?.into(),
             _ => RaftConfig::default(),
         };
 
@@ -78,7 +80,10 @@ impl WasmRaftNode {
             MemoryStorage::new(),
         );
 
-        Ok(WasmRaftNode { inner: node, transport })
+        Ok(WasmRaftNode {
+            inner: node,
+            transport,
+        })
     }
 
     /// Registers the JS function used to actually deliver outbound

@@ -24,7 +24,10 @@ pub struct PacemakerConfig {
 
 impl Default for PacemakerConfig {
     fn default() -> Self {
-        Self { base_timeout_ms: 400, max_timeout_ms: 8_000 }
+        Self {
+            base_timeout_ms: 400,
+            max_timeout_ms: 8_000,
+        }
     }
 }
 
@@ -51,19 +54,32 @@ pub struct CommittedCommand {
 /// Effects the driver must carry out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Output {
-    SendMessage { to: NodeId, msg: HotStuffMessage },
+    SendMessage {
+        to: NodeId,
+        msg: HotStuffMessage,
+    },
     /// Send to every other validator (the state machine has already
     /// processed the message locally where relevant).
-    Broadcast { msg: HotStuffMessage },
-    ApplyCommitted { commands: Vec<CommittedCommand> },
+    Broadcast {
+        msg: HotStuffMessage,
+    },
+    ApplyCommitted {
+        commands: Vec<CommittedCommand>,
+    },
     BecameLeader,
     BecameFollower,
     /// (Re)arm the single view timer with this duration.
-    ResetViewTimer { duration_ms: u64 },
+    ResetViewTimer {
+        duration_ms: u64,
+    },
     /// Command accepted by this leader; it will ride in a block at or
     /// after `view`. Completion is observed via `ApplyCommitted`.
-    Proposed { view: ViewNumber },
-    ProposeRejected { leader_hint: Option<NodeId> },
+    Proposed {
+        view: ViewNumber,
+    },
+    ProposeRejected {
+        leader_hint: Option<NodeId>,
+    },
 }
 
 /// Chained HotStuff replica state. `B` persists the block tree and the
@@ -158,9 +174,11 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
                 HotStuffMessage::Proposal { block, sig } => {
                     self.handle_proposal(from, block, sig, &mut out)
                 }
-                HotStuffMessage::Vote { view, block_hash, sig } => {
-                    self.handle_vote(view, block_hash, sig, &mut out)
-                }
+                HotStuffMessage::Vote {
+                    view,
+                    block_hash,
+                    sig,
+                } => self.handle_vote(view, block_hash, sig, &mut out),
                 HotStuffMessage::NewView { view, high_qc } => {
                     self.handle_new_view(from, view, high_qc, &mut out)
                 }
@@ -216,7 +234,12 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     /// timer reset and any leader/follower transition. `reset_backoff` is
     /// set on QC-driven advances (healthy pipeline) and cleared on the
     /// timeout path so the exponential backoff keeps growing.
-    fn enter_view(&mut self, new_view: ViewNumber, reset_backoff: bool, out: &mut Vec<Output>) -> bool {
+    fn enter_view(
+        &mut self,
+        new_view: ViewNumber,
+        reset_backoff: bool,
+        out: &mut Vec<Output>,
+    ) -> bool {
         if new_view <= self.current_view {
             return false;
         }
@@ -234,7 +257,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         let cv = self.current_view;
         self.votes.retain(|&(v, _), _| v + 1 >= cv);
         self.new_views.retain(|&v, _| v >= cv);
-        out.push(Output::ResetViewTimer { duration_ms: self.timer_duration() });
+        out.push(Output::ResetViewTimer {
+            duration_ms: self.timer_duration(),
+        });
         let now_leader = self.is_leader();
         if now_leader && !self.was_leader {
             out.push(Output::BecameLeader);
@@ -248,7 +273,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     /// Exponential backoff duration: `base * 2^consecutive_timeouts`,
     /// saturating and capped at `max_timeout_ms`.
     fn timer_duration(&self) -> u64 {
-        let factor = 1u64.checked_shl(self.consecutive_timeouts).unwrap_or(u64::MAX);
+        let factor = 1u64
+            .checked_shl(self.consecutive_timeouts)
+            .unwrap_or(u64::MAX);
         self.config
             .base_timeout_ms
             .saturating_mul(factor)
@@ -278,24 +305,38 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             justify: high_qc,
         };
         let digest = proposal_digest(block.view, &block.hash());
-        let sig = PartialSig { signer: self.id.clone(), signature: self.crypto.sign(&digest) };
+        let sig = PartialSig {
+            signer: self.id.clone(),
+            signature: self.crypto.sign(&digest),
+        };
         // Mark proposed before the local replica pass, which votes and
         // advances our view and would otherwise re-enter propose().
         self.last_proposed_view = self.current_view;
         self.in_propose = true;
         self.handle_proposal(self.id.clone(), block.clone(), sig.clone(), out);
         self.in_propose = false;
-        out.push(Output::Broadcast { msg: HotStuffMessage::Proposal { block, sig } });
+        out.push(Output::Broadcast {
+            msg: HotStuffMessage::Proposal { block, sig },
+        });
     }
 
     /// Validate a proposal and, if the SafeNode rule allows, vote on it.
     /// Invalid or unverifiable proposals are silently ignored (logged at
     /// debug). If the parent block is unknown we drop the proposal — there
     /// is no block-sync protocol in v1, so we cannot fetch it.
-    fn handle_proposal(&mut self, from: NodeId, block: Block, sig: PartialSig, out: &mut Vec<Output>) {
+    fn handle_proposal(
+        &mut self,
+        from: NodeId,
+        block: Block,
+        sig: PartialSig,
+        out: &mut Vec<Output>,
+    ) {
         let hash = block.hash();
         if self.leader_of(block.view).as_ref() != Some(&from) {
-            tracing::debug!(view = block.view, "hotstuff: proposal from non-leader, ignoring");
+            tracing::debug!(
+                view = block.view,
+                "hotstuff: proposal from non-leader, ignoring"
+            );
             return;
         }
         if block.view != self.current_view {
@@ -307,7 +348,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             return;
         }
         if sig.signer != from
-            || !self.crypto.verify(&from, &proposal_digest(block.view, &hash), &sig.signature)
+            || !self
+                .crypto
+                .verify(&from, &proposal_digest(block.view, &hash), &sig.signature)
         {
             tracing::debug!("hotstuff: bad proposal signature, ignoring");
             return;
@@ -366,13 +409,23 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             }
             Some(leader) => out.push(Output::SendMessage {
                 to: leader,
-                msg: HotStuffMessage::Vote { view: vote_view, block_hash: hash, sig: vote_sig },
+                msg: HotStuffMessage::Vote {
+                    view: vote_view,
+                    block_hash: hash,
+                    sig: vote_sig,
+                },
             }),
             None => {}
         }
     }
 
-    fn handle_vote(&mut self, view: ViewNumber, block_hash: BlockHash, sig: PartialSig, out: &mut Vec<Output>) {
+    fn handle_vote(
+        &mut self,
+        view: ViewNumber,
+        block_hash: BlockHash,
+        sig: PartialSig,
+        out: &mut Vec<Output>,
+    ) {
         // The signature (not the transport sender) identifies the voter.
         self.collect_vote(sig.signer.clone(), view, block_hash, sig.signature, out);
     }
@@ -382,11 +435,21 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     /// Byzantine double-vote cannot inflate the tally. On reaching a quorum
     /// we assemble the QC (with exactly the verified sigs) and fold it in,
     /// which advances us into `view + 1` and proposes if we lead it.
-    fn collect_vote(&mut self, signer: NodeId, view: ViewNumber, block_hash: BlockHash, sig: Vec<u8>, out: &mut Vec<Output>) {
+    fn collect_vote(
+        &mut self,
+        signer: NodeId,
+        view: ViewNumber,
+        block_hash: BlockHash,
+        sig: Vec<u8>,
+        out: &mut Vec<Output>,
+    ) {
         if self.leader_of(view + 1).as_ref() != Some(&self.id) || !self.is_validator(&signer) {
             return;
         }
-        if !self.crypto.verify(&signer, &vote_digest(view, &block_hash), &sig) {
+        if !self
+            .crypto
+            .verify(&signer, &vote_digest(view, &block_hash), &sig)
+        {
             tracing::debug!("hotstuff: vote with invalid signature, not counting");
             return;
         }
@@ -398,17 +461,30 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         }
         let mut signatures: Vec<PartialSig> = tally
             .iter()
-            .map(|(s, sg)| PartialSig { signer: s.clone(), signature: sg.clone() })
+            .map(|(s, sg)| PartialSig {
+                signer: s.clone(),
+                signature: sg.clone(),
+            })
             .collect();
         signatures.sort_by(|a, b| a.signer.0.cmp(&b.signer.0));
-        let qc = QuorumCert { view, block_hash, signatures };
+        let qc = QuorumCert {
+            view,
+            block_hash,
+            signatures,
+        };
         self.handle_qc(&qc, out);
     }
 
     /// Timeout-path liveness: fold the sender's high QC into our state,
     /// then (if we lead `view` and it is not stale) count the distinct
     /// senders; a quorum lets us propose extending the highest QC seen.
-    fn handle_new_view(&mut self, from: NodeId, view: ViewNumber, high_qc: QuorumCert, out: &mut Vec<Output>) {
+    fn handle_new_view(
+        &mut self,
+        from: NodeId,
+        view: ViewNumber,
+        high_qc: QuorumCert,
+        out: &mut Vec<Output>,
+    ) {
         // The carried QC self-certifies the NewView; an unverifiable one
         // must not count toward the recovery quorum, or a Byzantine peer
         // could pad it for free with garbage QCs.
@@ -454,7 +530,10 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             }
             Some(leader) => out.push(Output::SendMessage {
                 to: leader,
-                msg: HotStuffMessage::NewView { view: new_view, high_qc },
+                msg: HotStuffMessage::NewView {
+                    view: new_view,
+                    high_qc,
+                },
             }),
             None => {}
         }
@@ -649,20 +728,37 @@ mod tests {
             block_hash: block.hash(),
             signatures: signers
                 .iter()
-                .map(|s| PartialSig { signer: nid(s), signature: Vec::new() })
+                .map(|s| PartialSig {
+                    signer: nid(s),
+                    signature: Vec::new(),
+                })
                 .collect(),
         }
     }
 
     /// A child block extending `parent` at `view` with `justify`.
-    fn child(parent: &Block, view: ViewNumber, commands: Vec<Vec<u8>>, justify: QuorumCert) -> Block {
-        Block { parent: parent.hash(), view, height: parent.height + 1, commands, justify }
+    fn child(
+        parent: &Block,
+        view: ViewNumber,
+        commands: Vec<Vec<u8>>,
+        justify: QuorumCert,
+    ) -> Block {
+        Block {
+            parent: parent.hash(),
+            view,
+            height: parent.height + 1,
+            commands,
+            justify,
+        }
     }
 
     fn proposal_msg(block: &Block, leader: &str) -> HotStuffMessage {
         HotStuffMessage::Proposal {
             block: block.clone(),
-            sig: PartialSig { signer: nid(leader), signature: Vec::new() },
+            sig: PartialSig {
+                signer: nid(leader),
+                signature: Vec::new(),
+            },
         }
     }
 
@@ -671,7 +767,10 @@ mod tests {
         from: &str,
         msg: HotStuffMessage,
     ) -> Vec<Output> {
-        n.step(Event::Message { from: nid(from), msg })
+        n.step(Event::Message {
+            from: nid(from),
+            msg,
+        })
     }
 
     fn committed(outs: &[Output]) -> Vec<CommittedCommand> {
@@ -716,7 +815,11 @@ mod tests {
         let applied = committed(&out);
         assert_eq!(
             applied,
-            vec![CommittedCommand { sequence: 1, view: 1, command: b"cmd".to_vec() }]
+            vec![CommittedCommand {
+                sequence: 1,
+                view: 1,
+                command: b"cmd".to_vec()
+            }]
         );
         assert_eq!(a.committed_height(), 1);
     }
@@ -735,15 +838,25 @@ mod tests {
         assert_eq!(n.current_view, 2, "self-vote on b1 formed QC and advanced");
 
         // b2 carries the command; b3 and b4 pile on to close b2's 3-chain.
-        let out = n.step(Event::ClientPropose { command: b"pay".to_vec() });
+        let out = n.step(Event::ClientPropose {
+            command: b"pay".to_vec(),
+        });
         assert!(out.contains(&Output::Proposed { view: 2 }));
-        n.step(Event::ClientPropose { command: b"noop1".to_vec() });
-        let out = n.step(Event::ClientPropose { command: b"noop2".to_vec() });
+        n.step(Event::ClientPropose {
+            command: b"noop1".to_vec(),
+        });
+        let out = n.step(Event::ClientPropose {
+            command: b"noop2".to_vec(),
+        });
 
         let applied = committed(&out);
         assert_eq!(
             applied,
-            vec![CommittedCommand { sequence: 1, view: 2, command: b"pay".to_vec() }],
+            vec![CommittedCommand {
+                sequence: 1,
+                view: 2,
+                command: b"pay".to_vec()
+            }],
             "first real command commits with sequence 1"
         );
         assert_eq!(n.committed_height(), 2);
@@ -751,7 +864,13 @@ mod tests {
 
     fn is_vote(out: &[Output]) -> bool {
         out.iter().any(|o| {
-            matches!(o, Output::SendMessage { msg: HotStuffMessage::Vote { .. }, .. })
+            matches!(
+                o,
+                Output::SendMessage {
+                    msg: HotStuffMessage::Vote { .. },
+                    ..
+                }
+            )
         })
     }
 
@@ -771,7 +890,10 @@ mod tests {
         let b1 = child(&genesis, 1, vec![], QuorumCert::genesis());
         let out = deliver(&mut a, "b", proposal_msg(&b1, "b"));
 
-        assert!(!is_vote(&out), "must not vote when block.view <= last_voted_view");
+        assert!(
+            !is_vote(&out),
+            "must not vote when block.view <= last_voted_view"
+        );
         assert_eq!(a.store.last_voted_view(), 5, "vote record unchanged");
         assert_eq!(a.current_view, 1, "no vote means no view advance");
     }
@@ -799,7 +921,10 @@ mod tests {
         // (genesis, view 0) is not newer than the lock (view 1).
         let fork = child(&genesis, 4, vec![], QuorumCert::genesis());
         let out = deliver(&mut a, "e", proposal_msg(&fork, "e"));
-        assert!(!is_vote(&out), "must not vote on a lock-conflicting proposal");
+        assert!(
+            !is_vote(&out),
+            "must not vote on a lock-conflicting proposal"
+        );
         assert_eq!(a.store.last_voted_view(), 3, "vote record unchanged");
     }
 
@@ -821,17 +946,26 @@ mod tests {
         let vote_from = |s: &str| HotStuffMessage::Vote {
             view: 1,
             block_hash: b1.hash(),
-            sig: PartialSig { signer: nid(s), signature: Vec::new() },
+            sig: PartialSig {
+                signer: nid(s),
+                signature: Vec::new(),
+            },
         };
 
         // Two votes from the SAME signer: distinct tally is {c, a} = 2 < 3.
         let out1 = deliver(&mut c, "a", vote_from("a"));
         let out2 = deliver(&mut c, "a", vote_from("a"));
-        assert!(!has_broadcast(&out1) && !has_broadcast(&out2), "no QC from a duplicate");
+        assert!(
+            !has_broadcast(&out1) && !has_broadcast(&out2),
+            "no QC from a duplicate"
+        );
 
         // A genuinely distinct third signer reaches quorum -> propose b2.
         let out3 = deliver(&mut c, "d", vote_from("d"));
-        assert!(has_broadcast(&out3), "distinct quorum assembles the QC and proposes");
+        assert!(
+            has_broadcast(&out3),
+            "distinct quorum assembles the QC and proposes"
+        );
     }
 
     fn has_broadcast(out: &[Output]) -> bool {
@@ -865,12 +999,18 @@ mod tests {
         let genesis = Block::genesis();
         let b1 = child(&genesis, 1, vec![], QuorumCert::genesis());
         // Leader b's real signature over the proposal digest.
-        let prop_sig = sks[1].sign(&proposal_digest(1, &b1.hash())).to_bytes().to_vec();
+        let prop_sig = sks[1]
+            .sign(&proposal_digest(1, &b1.hash()))
+            .to_bytes()
+            .to_vec();
         c.step(Event::Message {
             from: nid("b"),
             msg: HotStuffMessage::Proposal {
                 block: b1.clone(),
-                sig: PartialSig { signer: nid("b"), signature: prop_sig },
+                sig: PartialSig {
+                    signer: nid("b"),
+                    signature: prop_sig,
+                },
             },
         });
         assert_eq!(c.current_view, 2, "c voted b1 and collected its own vote");
@@ -879,30 +1019,52 @@ mod tests {
         let signed_vote = |signer: &str, key: &SigningKey| HotStuffMessage::Vote {
             view: 1,
             block_hash: b1.hash(),
-            sig: PartialSig { signer: nid(signer), signature: key.sign(&vote_digest_b1).to_bytes().to_vec() },
+            sig: PartialSig {
+                signer: nid(signer),
+                signature: key.sign(&vote_digest_b1).to_bytes().to_vec(),
+            },
         };
 
         // Genuine vote from a (tally {c, a} = 2).
-        c.step(Event::Message { from: nid("a"), msg: signed_vote("a", &sks[0]) });
+        c.step(Event::Message {
+            from: nid("a"),
+            msg: signed_vote("a", &sks[0]),
+        });
         // Forged: claims to be d but signed with a's key -> verify fails.
         let forged = HotStuffMessage::Vote {
             view: 1,
             block_hash: b1.hash(),
-            sig: PartialSig { signer: nid("d"), signature: sks[0].sign(&vote_digest_b1).to_bytes().to_vec() },
+            sig: PartialSig {
+                signer: nid("d"),
+                signature: sks[0].sign(&vote_digest_b1).to_bytes().to_vec(),
+            },
         };
-        let out = c.step(Event::Message { from: nid("d"), msg: forged });
-        assert!(!has_broadcast(&out), "forged vote must not count toward quorum");
+        let out = c.step(Event::Message {
+            from: nid("d"),
+            msg: forged,
+        });
+        assert!(
+            !has_broadcast(&out),
+            "forged vote must not count toward quorum"
+        );
 
         // Genuine vote from d finishes the quorum -> propose.
-        let out = c.step(Event::Message { from: nid("d"), msg: signed_vote("d", &sks[3]) });
-        assert!(has_broadcast(&out), "genuine quorum assembles the QC and proposes");
+        let out = c.step(Event::Message {
+            from: nid("d"),
+            msg: signed_vote("d", &sks[3]),
+        });
+        assert!(
+            has_broadcast(&out),
+            "genuine quorum assembles the QC and proposes"
+        );
     }
 
     fn newview_target(out: &[Output]) -> Option<(NodeId, ViewNumber)> {
         out.iter().find_map(|o| match o {
-            Output::SendMessage { to, msg: HotStuffMessage::NewView { view, .. } } => {
-                Some((to.clone(), *view))
-            }
+            Output::SendMessage {
+                to,
+                msg: HotStuffMessage::NewView { view, .. },
+            } => Some((to.clone(), *view)),
             _ => None,
         })
     }
@@ -925,13 +1087,25 @@ mod tests {
 
         let out = a.step(Event::ViewTimeout);
         assert_eq!(a.current_view, 2);
-        assert_eq!(newview_target(&out), Some((nid("c"), 2)), "NewView -> leader(2)=c");
+        assert_eq!(
+            newview_target(&out),
+            Some((nid("c"), 2)),
+            "NewView -> leader(2)=c"
+        );
         assert_eq!(reset_duration(&out), Some(800), "first backoff = base * 2");
 
         let out = a.step(Event::ViewTimeout);
         assert_eq!(a.current_view, 3);
-        assert_eq!(newview_target(&out), Some((nid("d"), 3)), "NewView -> leader(3)=d");
-        assert_eq!(reset_duration(&out), Some(1600), "second backoff = base * 4");
+        assert_eq!(
+            newview_target(&out),
+            Some((nid("d"), 3)),
+            "NewView -> leader(3)=d"
+        );
+        assert_eq!(
+            reset_duration(&out),
+            Some(1600),
+            "second backoff = base * 4"
+        );
     }
 
     /// Test 5b — timeout recovery: the leader of a view that gathers a
@@ -946,7 +1120,10 @@ mod tests {
 
         let new_view = |from: &str| Event::Message {
             from: nid(from),
-            msg: HotStuffMessage::NewView { view: 2, high_qc: QuorumCert::genesis() },
+            msg: HotStuffMessage::NewView {
+                view: 2,
+                high_qc: QuorumCert::genesis(),
+            },
         };
 
         // Three distinct NewViews are not yet a quorum of four.
@@ -962,7 +1139,9 @@ mod tests {
         assert!(c.current_view >= 2, "entered the recovery view");
         assert!(out.contains(&Output::BecameLeader));
         let proposed_view = out.iter().find_map(|o| match o {
-            Output::Broadcast { msg: HotStuffMessage::Proposal { block, .. } } => Some(block.view),
+            Output::Broadcast {
+                msg: HotStuffMessage::Proposal { block, .. },
+            } => Some(block.view),
             _ => None,
         });
         assert_eq!(proposed_view, Some(2), "recovery leader proposes in view 2");
@@ -977,8 +1156,15 @@ mod tests {
         a.bootstrap(); // leader(1) = b, so a is a follower
         assert!(!a.is_leader());
 
-        let out = a.step(Event::ClientPropose { command: b"x".to_vec() });
-        assert_eq!(out, vec![Output::ProposeRejected { leader_hint: Some(nid("b")) }]);
+        let out = a.step(Event::ClientPropose {
+            command: b"x".to_vec(),
+        });
+        assert_eq!(
+            out,
+            vec![Output::ProposeRejected {
+                leader_hint: Some(nid("b"))
+            }]
+        );
     }
 
     /// Robustness #1 — a NewView whose carried high QC does not verify must
@@ -994,16 +1180,29 @@ mod tests {
         let bogus = QuorumCert {
             view: 2,
             block_hash: BlockHash([3u8; 32]),
-            signatures: vec![PartialSig { signer: nid("a"), signature: Vec::new() }],
+            signatures: vec![PartialSig {
+                signer: nid("a"),
+                signature: Vec::new(),
+            }],
         };
         for from in ["a", "b", "d", "e"] {
             let out = c.step(Event::Message {
                 from: nid(from),
-                msg: HotStuffMessage::NewView { view: 2, high_qc: bogus.clone() },
+                msg: HotStuffMessage::NewView {
+                    view: 2,
+                    high_qc: bogus.clone(),
+                },
             });
-            assert!(!has_broadcast(&out), "invalid NewView must not drive a proposal");
+            assert!(
+                !has_broadcast(&out),
+                "invalid NewView must not drive a proposal"
+            );
         }
-        assert_eq!(c.new_views.len(), 0, "unverifiable NewViews are never recorded");
+        assert_eq!(
+            c.new_views.len(),
+            0,
+            "unverifiable NewViews are never recorded"
+        );
         assert_eq!(c.current_view, 1, "no valid quorum -> no recovery");
     }
 
@@ -1022,12 +1221,18 @@ mod tests {
             msg: HotStuffMessage::Vote {
                 view: 4,
                 block_hash: BlockHash([9u8; 32]),
-                sig: PartialSig { signer: nid("b"), signature: Vec::new() },
+                sig: PartialSig {
+                    signer: nid("b"),
+                    signature: Vec::new(),
+                },
             },
         });
         a.step(Event::Message {
             from: nid("b"),
-            msg: HotStuffMessage::NewView { view: 5, high_qc: QuorumCert::genesis() },
+            msg: HotStuffMessage::NewView {
+                view: 5,
+                high_qc: QuorumCert::genesis(),
+            },
         });
         assert_eq!(a.votes.len(), 1);
         assert_eq!(a.new_views.len(), 1);
@@ -1035,7 +1240,11 @@ mod tests {
         // Jumping well past view 5 evicts both now-useless entries.
         a.enter_view(10, true, &mut Vec::new());
         assert_eq!(a.votes.len(), 0, "vote round 4 is dead once past view 5");
-        assert_eq!(a.new_views.len(), 0, "NewView round 5 is dead once past view 5");
+        assert_eq!(
+            a.new_views.len(),
+            0,
+            "NewView round 5 is dead once past view 5"
+        );
     }
 
     /// Robustness #3 — RemovePeer must never strand consensus: removing

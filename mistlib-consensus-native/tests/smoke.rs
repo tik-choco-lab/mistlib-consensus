@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use mistlib_consensus_native::{spawn_native, MemoryStorage, NodeId, RaftConfig, RaftMessage, RaftTransport, Role};
+use mistlib_consensus_native::{
+    spawn_native, MemoryStorage, NodeId, RaftConfig, RaftMessage, RaftTransport, Role,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +38,10 @@ async fn single_node_cluster_becomes_leader() {
     .await;
     assert!(became_leader.is_ok(), "node never became leader");
 
-    let index = node.propose(b"hello".to_vec()).await.expect("propose should succeed");
+    let index = node
+        .propose(b"hello".to_vec())
+        .await
+        .expect("propose should succeed");
     assert_eq!(index, 1);
 
     node.shutdown();

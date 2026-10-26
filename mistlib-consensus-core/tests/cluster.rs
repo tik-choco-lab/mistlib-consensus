@@ -49,7 +49,10 @@ impl RaftTransport for MockTransport {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_elects_leader_and_replicates() {
-    let ids: Vec<NodeId> = ["n1", "n2", "n3"].iter().map(|s| NodeId(s.to_string())).collect();
+    let ids: Vec<NodeId> = ["n1", "n2", "n3"]
+        .iter()
+        .map(|s| NodeId(s.to_string()))
+        .collect();
 
     let mut inbound_txs = HashMap::new();
     let mut inbound_rxs = HashMap::new();
@@ -118,7 +121,11 @@ async fn three_node_cluster_elects_leader_and_replicates() {
                 .expect("committed channel closed unexpectedly");
             applied.push(entry.command[0]);
         }
-        assert_eq!(applied, vec![0, 1, 2, 3, 4], "node {id:?} applied out of order");
+        assert_eq!(
+            applied,
+            vec![0, 1, 2, 3, 4],
+            "node {id:?} applied out of order"
+        );
     }
 
     for node in nodes.values() {
@@ -126,9 +133,7 @@ async fn three_node_cluster_elects_leader_and_replicates() {
     }
 }
 
-async fn wait_for_leader(
-    nodes: &HashMap<NodeId, Arc<RaftNode<MemoryStorage>>>,
-) -> NodeId {
+async fn wait_for_leader(nodes: &HashMap<NodeId, Arc<RaftNode<MemoryStorage>>>) -> NodeId {
     tokio::time::timeout(StdDuration::from_secs(5), async {
         loop {
             for (id, node) in nodes {

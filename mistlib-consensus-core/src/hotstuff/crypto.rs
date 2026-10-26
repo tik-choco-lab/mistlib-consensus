@@ -40,7 +40,10 @@ pub struct Ed25519Crypto {
 
 impl Ed25519Crypto {
     pub fn new(signing_key: SigningKey, registry: HashMap<NodeId, VerifyingKey>) -> Self {
-        Self { signing_key, registry }
+        Self {
+            signing_key,
+            registry,
+        }
     }
 
     pub fn verifying_key(&self) -> VerifyingKey {

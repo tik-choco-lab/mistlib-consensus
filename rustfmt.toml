@@ -1,0 +1,6 @@
+# Locks Rust formatting so PR diffs stay semantic-only (same settings as mistlib).
+# Stable-channel options only — nightly-only keys would be ignored with a warning.
+edition = "2021"
+max_width = 100
+# Force LF so line endings never show up as diff noise for Windows contributors.
+newline_style = "Unix"
