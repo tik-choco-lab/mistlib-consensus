@@ -201,13 +201,15 @@ security audit has been done. Specifically:
   disk-backed implementations of `RaftStorage` / `BlockStore`.
 - **Membership changes are operator-trusted.** `add_peer` / `remove_peer` apply directly rather
   than replicating through the log, and there is no BFT reconfiguration.
-- **No block-sync protocol.** A HotStuff replica that misses a proposal whose parent it never
-  stored ignores descendants until the pacemaker catches it up. Fine over reliable ordered links;
-  a fetch-missing-ancestors protocol is future work.
+- **Stored HotStuff history still needs a retention policy.** Missing blocks are fetched with
+  bounded requests and validated ancestor batches; pending proposals have count/byte/view limits.
+  The block store retains accepted/certified history. Checkpointing and safe history pruning remain
+  future work; long catch-up gaps can require repeated ancestor downloads.
 - **Quorum certificates are O(n).** A vector of Ed25519 signatures; threshold/BLS aggregation is
   future work.
 - **Inbound flow control is partial.** Wire messages are size-capped, but inbound channels are
-  unbounded. Per-peer rate limiting is future work.
+  unbounded. Per-validator rate limiting covers block-request serving only; general inbound
+  per-peer limits and application command admission remain the embedder's responsibility.
 
 The API is not stable and the wire format may change between releases.
 

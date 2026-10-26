@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 pub type ViewNumber = u64;
 
 /// SHA-256 digest identifying a [`Block`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BlockHash(pub [u8; 32]);
 
 impl BlockHash {
@@ -86,8 +86,8 @@ impl Block {
         }
     }
 
-    /// Content-addressed hash over every field, domain-separated and
-    /// length-prefixed so distinct blocks can never collide structurally.
+    /// Content-addressed hash over block fields and justify view/hash, domain-separated and
+    /// length-prefixed. QC signature witnesses do not affect block identity.
     pub fn hash(&self) -> BlockHash {
         let mut h = Sha256::new();
         h.update(b"mistlib-hs-block");
@@ -143,14 +143,61 @@ pub enum HotStuffMessage {
         view: ViewNumber,
         high_qc: QuorumCert,
     },
+    /// Fetch a content-addressed block and a bounded chain of ancestors.
+    BlockRequest {
+        hash: BlockHash,
+        request_id: u64,
+        max_blocks: u32,
+    },
+    /// Descending chain, starting at `hash`. Echoes the request token.
+    BlockResponse {
+        hash: BlockHash,
+        request_id: u64,
+        blocks: Vec<Block>,
+    },
 }
 
 impl HotStuffMessage {
+    /// Consensus view, or zero for block-sync control messages.
     pub fn view(&self) -> ViewNumber {
         match self {
             HotStuffMessage::Proposal { block, .. } => block.view,
             HotStuffMessage::Vote { view, .. } => *view,
             HotStuffMessage::NewView { view, .. } => *view,
+            HotStuffMessage::BlockRequest { .. } | HotStuffMessage::BlockResponse { .. } => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bincode::Options;
+
+    #[test]
+    fn sync_wire_tags_and_encoding_are_stable() {
+        let request = HotStuffMessage::BlockRequest {
+            hash: BlockHash([7; 32]),
+            request_id: 9,
+            max_blocks: 32,
+        };
+        let mut expected = 3u32.to_le_bytes().to_vec();
+        expected.extend([7; 32]);
+        expected.extend(9u64.to_le_bytes());
+        expected.extend(32u32.to_le_bytes());
+        assert_eq!(bincode::serialize(&request).unwrap(), expected);
+        let response = HotStuffMessage::BlockResponse {
+            hash: BlockHash([7; 32]),
+            request_id: 9,
+            blocks: vec![Block::genesis()],
+        };
+        let bytes = bincode::serialize(&response).unwrap();
+        assert_eq!(&bytes[..4], &4u32.to_le_bytes());
+        let decoded: HotStuffMessage = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(4 * 1024 * 1024)
+            .deserialize(&bytes)
+            .unwrap();
+        assert_eq!(decoded, response);
     }
 }

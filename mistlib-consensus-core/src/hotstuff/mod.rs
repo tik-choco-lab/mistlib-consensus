@@ -14,6 +14,9 @@ pub mod transport;
 pub use crypto::{CryptoProvider, Ed25519Crypto, NoopCrypto};
 pub use message::{Block, BlockHash, HotStuffMessage, PartialSig, QuorumCert, ViewNumber};
 pub use node::HotStuffNode;
-pub use state::{CommittedCommand, Event, HotStuffState, Output, PacemakerConfig};
+pub use state::{
+    CommittedCommand, Event, HotStuffState, Output, PacemakerConfig, SyncConfig,
+    MAX_BLOCKS_PER_RESPONSE, MAX_BLOCK_RESPONSE_BYTES,
+};
 pub use storage::{BlockStore, MemoryBlockStore};
 pub use transport::{HotStuffMistTransport, HotStuffTransport};

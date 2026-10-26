@@ -3,6 +3,11 @@
 //! [`Event`]s and produces [`Output`]s. Protocol rules are specified in
 //! `docs/hotstuff-design.md`.
 
+mod sync;
+#[cfg(test)]
+mod sync_tests;
+pub use sync::{MAX_BLOCKS_PER_RESPONSE, MAX_BLOCK_RESPONSE_BYTES};
+
 use super::crypto::CryptoProvider;
 use super::message::{
     proposal_digest, vote_digest, Block, BlockHash, HotStuffMessage, PartialSig, QuorumCert,
@@ -20,6 +25,8 @@ pub struct PacemakerConfig {
     pub base_timeout_ms: u64,
     /// Upper bound for the backed-off timeout.
     pub max_timeout_ms: u64,
+    /// Pending-state and block-fetch limits.
+    pub sync: SyncConfig,
 }
 
 impl Default for PacemakerConfig {
@@ -27,6 +34,35 @@ impl Default for PacemakerConfig {
         Self {
             base_timeout_ms: 400,
             max_timeout_ms: 8_000,
+            sync: SyncConfig::default(),
+        }
+    }
+}
+
+/// Bounds for untrusted pending state and ancestor recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncConfig {
+    pub max_future_views: u64,
+    pub max_deferred_blocks: usize,
+    pub max_deferred_bytes: u64,
+    pub max_inflight_requests: usize,
+    /// Attempts per cursor, including the initial request.
+    pub max_fetch_attempts: u32,
+    pub retry_base_ms: u64,
+    /// Minimum interval between responses to a validator, rounded up to 100ms.
+    pub serve_interval_ms: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            max_future_views: 128,
+            max_deferred_blocks: 256,
+            max_deferred_bytes: 16 * 1024 * 1024,
+            max_inflight_requests: 32,
+            max_fetch_attempts: 8,
+            retry_base_ms: 300,
+            serve_interval_ms: 100,
         }
     }
 }
@@ -34,11 +70,22 @@ impl Default for PacemakerConfig {
 /// Inputs the driver feeds into the state machine.
 #[derive(Debug, Clone)]
 pub enum Event {
-    Message { from: NodeId, msg: HotStuffMessage },
+    Message {
+        from: NodeId,
+        msg: HotStuffMessage,
+    },
     ViewTimeout,
-    ClientPropose { command: Vec<u8> },
-    AddPeer { peer: NodeId },
-    RemovePeer { peer: NodeId },
+    /// Driver-owned periodic timer for fetch retries and serving budgets.
+    SyncTick,
+    ClientPropose {
+        command: Vec<u8>,
+    },
+    AddPeer {
+        peer: NodeId,
+    },
+    RemovePeer {
+        peer: NodeId,
+    },
 }
 
 /// A command that reached the 3-chain commit point, in execution order.
@@ -70,6 +117,10 @@ pub enum Output {
     BecameFollower,
     /// (Re)arm the single view timer with this duration.
     ResetViewTimer {
+        duration_ms: u64,
+    },
+    /// Arm the single maintenance timer (independent of view epochs).
+    ScheduleSyncTick {
         duration_ms: u64,
     },
     /// Command accepted by this leader; it will ride in a block at or
@@ -111,10 +162,18 @@ pub struct HotStuffState<B: BlockStore, C: CryptoProvider> {
     new_views: HashMap<ViewNumber, HashSet<NodeId>>,
     /// Authenticated proposals waiting for an in-flight parent. Messages
     /// from successive leaders can arrive in either order.
-    pending_proposals: HashMap<BlockHash, Vec<Block>>,
+    pending_proposals: BTreeMap<ViewNumber, Block>,
     /// Recovery proposals can arrive before our local timeout enters their
     /// view. A leader signature alone cannot authorize skipping views.
-    future_proposals: BTreeMap<ViewNumber, Vec<Block>>,
+    future_proposals: BTreeMap<ViewNumber, Block>,
+    /// First authenticated proposal per live view (also bounds stored equivocations).
+    proposal_views: BTreeMap<ViewNumber, BlockHash>,
+    fetches: BTreeMap<BlockHash, sync::Fetch>,
+    sync_tick: u64,
+    next_request_id: u64,
+    serve_after: HashMap<NodeId, u64>,
+    committed_view: ViewNumber,
+    committed_hash: BlockHash,
     /// Whether this node led the view it most recently entered, so
     /// `BecameLeader`/`BecameFollower` fire only on genuine transitions.
     was_leader: bool,
@@ -153,8 +212,15 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             pending_commands: Vec::new(),
             votes: HashMap::new(),
             new_views: HashMap::new(),
-            pending_proposals: HashMap::new(),
+            pending_proposals: BTreeMap::new(),
             future_proposals: BTreeMap::new(),
+            proposal_views: BTreeMap::new(),
+            fetches: BTreeMap::new(),
+            sync_tick: 0,
+            next_request_id: 0,
+            serve_after: HashMap::new(),
+            committed_view: 0,
+            committed_hash: Block::genesis().hash(),
             was_leader: false,
             in_propose: false,
             exec_sequence: 0,
@@ -167,7 +233,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     /// view 1 (the genesis QC drives the entry, so it is a happy-path
     /// proposal extending the genesis block).
     pub fn bootstrap(&mut self) -> Vec<Output> {
-        let mut out = Vec::new();
+        let mut out = vec![Output::ScheduleSyncTick {
+            duration_ms: sync::TICK_MS,
+        }];
         if self.enter_view(1, &mut out) {
             self.propose(&mut out);
         }
@@ -190,8 +258,23 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
                 HotStuffMessage::NewView { view, high_qc } => {
                     self.handle_new_view(from, view, high_qc, &mut out)
                 }
+                HotStuffMessage::BlockRequest {
+                    hash,
+                    request_id,
+                    max_blocks,
+                } => {
+                    self.serve_blocks(from, hash, request_id, max_blocks, &mut out);
+                }
+                HotStuffMessage::BlockResponse {
+                    hash,
+                    request_id,
+                    blocks,
+                } => {
+                    self.receive_blocks(from, hash, request_id, blocks, &mut out);
+                }
             },
             Event::ViewTimeout => self.handle_timeout(&mut out),
+            Event::SyncTick => self.sync_maintenance(&mut out),
             Event::ClientPropose { command } => {
                 if self.is_leader() {
                     // The command rides the block for `view`; if we already
@@ -234,12 +317,11 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         }
         // A timeout or QC may have made an early recovery proposal eligible.
         // Iterate because voting on it can admit another queued view.
-        while let Some(blocks) = self.future_proposals.remove(&self.current_view) {
-            for block in blocks {
-                self.process_proposal(block, &mut out);
-            }
+        while let Some(block) = self.future_proposals.remove(&self.current_view) {
+            self.accept_ready(block, true, &mut out);
         }
-        self.future_proposals.retain(|&v, _| v > self.current_view);
+        self.prune_pending();
+        self.ensure_high_qc_fetch(&mut out);
         out
     }
 
@@ -263,7 +345,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         // `V`, dead once we are past `V`. Future-view entries are retained —
         // we may lead those views later.
         let cv = self.current_view;
-        self.votes.retain(|&(v, _), _| v + 1 >= cv);
+        self.votes.retain(|&(v, _), _| v.saturating_add(1) >= cv);
         self.new_views.retain(|&v, _| v >= cv);
         out.push(Output::ResetViewTimer {
             duration_ms: self.timer_duration(),
@@ -313,7 +395,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         }
         let parent_height = match self.store.get_block(&high_qc.block_hash) {
             Some(p) => p.height,
-            // Parent missing (no block sync in v1): we cannot extend it.
+            // Block sync will retry proposing once the parent is available.
             None => return,
         };
         let commands = std::mem::take(&mut self.pending_commands);
@@ -351,6 +433,12 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         sig: PartialSig,
         out: &mut Vec<Output>,
     ) {
+        if !bincode::serialized_size(&block)
+            .is_ok_and(|n| n <= super::transport::MAX_WIRE_MESSAGE_BYTES)
+            || block.view == u64::MAX
+        {
+            return;
+        }
         let hash = block.hash();
         if self.leader_of(block.view).as_ref() != Some(&from) {
             tracing::debug!(
@@ -375,40 +463,97 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             tracing::debug!("hotstuff: proposal parent does not match its justify, ignoring");
             return;
         }
-        if self.store.contains_block(&hash) {
+        // A verified certificate can catch up a replica beyond the lookahead;
+        // an unaided future leader signature cannot move the pacemaker.
+        if block.view
+            > self
+                .current_view
+                .saturating_add(self.config.sync.max_future_views)
+            && block.justify.view > self.store.high_qc().view
+        {
+            self.handle_qc(&block.justify, out);
+            self.request_block(block.parent, block.justify.view, from.clone(), out);
+        }
+        if !self.in_view_window(block.view)
+            || block.view <= self.store.locked_qc().view
+            || block.height <= self.committed_height
+        {
             return;
         }
+        if self.store.contains_block(&hash)
+            && (block.view != self.current_view || block.view <= self.store.last_voted_view())
+        {
+            return;
+        }
+        if self
+            .proposal_views
+            .get(&block.view)
+            .is_some_and(|seen| *seen != hash || !self.store.contains_block(&hash))
+        {
+            tracing::debug!(
+                view = block.view,
+                "hotstuff: duplicate/equivocating proposal ignored"
+            );
+            return;
+        }
+        self.proposal_views.insert(block.view, hash);
         if !self.store.contains_block(&block.parent) {
-            let waiting = self.pending_proposals.entry(block.parent).or_default();
-            if !waiting.iter().any(|b| b.hash() == hash) {
-                waiting.push(block);
+            let parent = block.parent;
+            let parent_view = block.justify.view;
+            self.pending_proposals.insert(block.view, block);
+            self.trim_deferred();
+            if self.pending_proposals.values().any(|b| b.parent == parent) {
+                self.request_block(parent, parent_view, from, out);
             }
             return;
         }
-        // Iterative replay also handles a whole chain delivered backwards,
-        // without unbounded recursion on the replica's stack.
-        let mut ready = std::collections::VecDeque::from([block]);
-        while let Some(block) = ready.pop_front() {
+        self.accept_ready(block, true, out);
+    }
+
+    /// Replay authenticated children iteratively. Fetched blocks never vote.
+    fn accept_ready(&mut self, block: Block, vote: bool, out: &mut Vec<Output>) {
+        let mut ready = std::collections::VecDeque::from([(block, vote)]);
+        while let Some((block, vote)) = ready.pop_front() {
             let hash = block.hash();
-            self.process_proposal(block, out);
+            self.process_proposal(block, vote, out);
             if self.store.contains_block(&hash) {
-                if let Some(children) = self.pending_proposals.remove(&hash) {
-                    ready.extend(children);
+                self.fetches.remove(&hash);
+                let views: Vec<_> = self
+                    .pending_proposals
+                    .iter()
+                    .filter_map(|(&v, b)| (b.parent == hash).then_some(v))
+                    .collect();
+                for view in views {
+                    if let Some(child) = self.pending_proposals.remove(&view) {
+                        ready.push_back((child, true));
+                    }
                 }
             }
         }
     }
 
     /// Process an authenticated proposal whose parent is now available.
-    fn process_proposal(&mut self, block: Block, out: &mut Vec<Output>) {
+    fn process_proposal(&mut self, block: Block, vote: bool, out: &mut Vec<Output>) {
         let hash = block.hash();
         let parent = match self.store.get_block(&block.parent) {
             Some(p) => p,
             None => return,
         };
-        if block.height != parent.height + 1 || block.justify.view != parent.view {
+        if parent.height.checked_add(1) != Some(block.height)
+            || block.justify.view != parent.view
+            || (block.height > self.committed_height && !self.extends(&block, &self.committed_hash))
+        {
             tracing::debug!("hotstuff: proposal height is not parent + 1, ignoring");
+            self.proposal_views.remove(&block.view);
             return;
+        }
+        if vote && block.view > self.current_view {
+            self.handle_qc(&block.justify, out);
+            if block.view > self.current_view {
+                self.future_proposals.entry(block.view).or_insert(block);
+                self.trim_deferred();
+                return;
+            }
         }
 
         // Storage and QC learning are independent of whether we can still
@@ -424,11 +569,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             self.handle_qc(&high_qc, out);
             self.propose(out);
         }
-        if block.view > self.current_view {
-            self.future_proposals
-                .entry(block.view)
-                .or_default()
-                .push(block);
+        if !vote {
             return;
         }
 
@@ -495,7 +636,12 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         sig: Vec<u8>,
         out: &mut Vec<Output>,
     ) {
-        if self.leader_of(view + 1).as_ref() != Some(&self.id) || !self.is_validator(&signer) {
+        if !self.in_view_window(view)
+            || view.saturating_add(1) < self.current_view
+            || view == u64::MAX
+            || self.leader_of(view + 1).as_ref() != Some(&self.id)
+            || !self.is_validator(&signer)
+        {
             return;
         }
         if !self
@@ -505,7 +651,16 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             tracing::debug!("hotstuff: vote with invalid signature, not counting");
             return;
         }
+        // Keep only the first vote from each validator in each view.
+        if self
+            .votes
+            .iter()
+            .any(|(&(v, _), tally)| v == view && tally.contains_key(&signer))
+        {
+            return;
+        }
         let quorum = self.quorum();
+        let preferred = signer.clone();
         let tally = self.votes.entry((view, block_hash)).or_default();
         tally.insert(signer, sig);
         if tally.len() != quorum {
@@ -525,6 +680,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             signatures,
         };
         self.handle_qc(&qc, out);
+        self.request_block(qc.block_hash, qc.view, preferred, out);
     }
 
     /// Timeout-path liveness: fold the sender's high QC into our state,
@@ -540,17 +696,19 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         // The carried QC self-certifies the NewView; an unverifiable one
         // must not count toward the recovery quorum, or a Byzantine peer
         // could pad it for free with garbage QCs.
-        if !self.verify_qc(&high_qc) {
+        if !self.is_validator(&from) || !self.verify_qc(&high_qc) {
             tracing::debug!(view, "hotstuff: NewView with an invalid high QC, ignoring");
             return;
         }
         self.handle_qc(&high_qc, out);
+        self.request_block(high_qc.block_hash, high_qc.view, from.clone(), out);
         self.record_new_view(view, from, out);
     }
 
     fn record_new_view(&mut self, view: ViewNumber, sender: NodeId, out: &mut Vec<Output>) {
         if self.leader_of(view).as_ref() != Some(&self.id)
             || view < self.current_view
+            || !self.in_view_window(view)
             || !self.is_validator(&sender)
         {
             return;
@@ -570,6 +728,7 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
     /// Pacemaker fired: abandon the current view, move to the next, and ask
     /// its leader to propose by sending a NewView carrying our high QC.
     fn handle_timeout(&mut self, out: &mut Vec<Output>) {
+        self.restart_exhausted_fetches(out);
         self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
         let new_view = self.current_view + 1;
         self.enter_view(new_view, out);
@@ -654,6 +813,8 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             }
         }
         self.committed_height = block.height;
+        self.committed_view = block.view;
+        self.committed_hash = block.hash();
         self.consecutive_timeouts = 0;
         if !commands.is_empty() {
             out.push(Output::ApplyCommitted { commands });
@@ -667,6 +828,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
         if qc.view == 0 && qc.block_hash == Block::genesis().hash() {
             return true;
         }
+        if qc.view == u64::MAX || qc.signatures.len() > self.validators.len() {
+            return false;
+        }
         let digest = vote_digest(qc.view, &qc.block_hash);
         let mut distinct = HashSet::new();
         for ps in &qc.signatures {
@@ -676,7 +840,9 @@ impl<B: BlockStore, C: CryptoProvider> HotStuffState<B, C> {
             if !self.crypto.verify(&ps.signer, &digest, &ps.signature) {
                 return false;
             }
-            distinct.insert(ps.signer.clone());
+            if !distinct.insert(ps.signer.clone()) {
+                return false;
+            }
         }
         distinct.len() >= self.quorum()
     }
@@ -752,17 +918,17 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
-    fn nid(s: &str) -> NodeId {
+    pub(super) fn nid(s: &str) -> NodeId {
         NodeId(s.to_string())
     }
 
-    fn ids(names: &[&str]) -> Vec<NodeId> {
+    pub(super) fn ids(names: &[&str]) -> Vec<NodeId> {
         names.iter().map(|s| nid(s)).collect()
     }
 
     /// A node over the full validator set `all` (self included; `new`
     /// re-adds self, sorts and dedups so passing the whole set is fine).
-    fn node(id: &str, all: &[&str]) -> HotStuffState<MemoryBlockStore, NoopCrypto> {
+    pub(super) fn node(id: &str, all: &[&str]) -> HotStuffState<MemoryBlockStore, NoopCrypto> {
         HotStuffState::new(
             nid(id),
             ids(all),
@@ -775,7 +941,7 @@ mod tests {
     // ----- helpers to craft protocol messages for single-node drive-through -----
 
     /// A QC over `block` signed by `signers` (NoopCrypto: bytes ignored).
-    fn qc(block: &Block, signers: &[&str]) -> QuorumCert {
+    pub(super) fn qc(block: &Block, signers: &[&str]) -> QuorumCert {
         QuorumCert {
             view: block.view,
             block_hash: block.hash(),
@@ -790,7 +956,7 @@ mod tests {
     }
 
     /// A child block extending `parent` at `view` with `justify`.
-    fn child(
+    pub(super) fn child(
         parent: &Block,
         view: ViewNumber,
         commands: Vec<Vec<u8>>,
@@ -805,7 +971,7 @@ mod tests {
         }
     }
 
-    fn proposal_msg(block: &Block, leader: &str) -> HotStuffMessage {
+    pub(super) fn proposal_msg(block: &Block, leader: &str) -> HotStuffMessage {
         HotStuffMessage::Proposal {
             block: block.clone(),
             sig: PartialSig {
@@ -815,7 +981,7 @@ mod tests {
         }
     }
 
-    fn deliver(
+    pub(super) fn deliver(
         n: &mut HotStuffState<MemoryBlockStore, NoopCrypto>,
         from: &str,
         msg: HotStuffMessage,
@@ -826,7 +992,7 @@ mod tests {
         })
     }
 
-    fn committed(outs: &[Output]) -> Vec<CommittedCommand> {
+    pub(super) fn committed(outs: &[Output]) -> Vec<CommittedCommand> {
         outs.iter()
             .flat_map(|o| match o {
                 Output::ApplyCommitted { commands } => commands.clone(),
@@ -915,7 +1081,7 @@ mod tests {
         assert_eq!(n.committed_height(), 2);
     }
 
-    fn is_vote(out: &[Output]) -> bool {
+    pub(super) fn is_vote(out: &[Output]) -> bool {
         out.iter().any(|o| {
             matches!(
                 o,

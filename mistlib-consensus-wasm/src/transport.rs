@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use js_sys::{Function, Uint8Array};
+use mistlib_consensus_core::hotstuff::{HotStuffMessage, HotStuffTransport};
 use mistlib_consensus_core::{NodeId, RaftError, RaftMessage, RaftTransport, Result};
 use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
@@ -16,6 +17,20 @@ pub struct CallbackTransport {
 impl CallbackTransport {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn send_bytes(&self, to: &NodeId, bytes: &[u8]) -> Result<()> {
+        let cb = self.send_cb.borrow().clone();
+        match cb {
+            Some(cb) => {
+                let array = Uint8Array::from(bytes);
+                let this = JsValue::NULL;
+                cb.call2(&this, &JsValue::from_str(&to.0), &array)
+                    .map_err(|e| RaftError::Transport(format!("{e:?}")))?;
+                Ok(())
+            }
+            None => Err(RaftError::Transport("no send callback registered".into())),
+        }
     }
 
     pub fn set_send_callback(&self, cb: Function) {
@@ -35,16 +50,16 @@ unsafe impl Sync for CallbackTransport {}
 impl RaftTransport for CallbackTransport {
     async fn send(&self, to: &NodeId, msg: RaftMessage) -> Result<()> {
         let bytes = bincode::serialize(&msg)?;
-        let cb = self.send_cb.borrow().clone();
-        match cb {
-            Some(cb) => {
-                let array = Uint8Array::from(bytes.as_slice());
-                let this = JsValue::NULL;
-                cb.call2(&this, &JsValue::from_str(&to.0), &array)
-                    .map_err(|e| RaftError::Transport(format!("{e:?}")))?;
-                Ok(())
-            }
-            None => Err(RaftError::Transport("no send callback registered".into())),
-        }
+        self.send_bytes(to, &bytes)
+    }
+}
+
+// Rust embedders can drive HotStuff on wasm with the same opaque byte
+// callback. The existing wasm-bindgen node facade remains Raft-specific.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl HotStuffTransport for CallbackTransport {
+    async fn send(&self, to: &NodeId, msg: HotStuffMessage) -> Result<()> {
+        self.send_bytes(to, &bincode::serialize(&msg)?)
     }
 }

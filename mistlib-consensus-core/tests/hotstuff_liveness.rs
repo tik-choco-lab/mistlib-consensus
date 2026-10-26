@@ -128,7 +128,7 @@ fn proposals_from_successive_leaders_can_arrive_in_reverse_order() {
     let b3 = child(&b2, 3, &names[1..]);
     let b4 = child(&b3, 4, &names[1..]);
     for block in [&b4, &b3, &b2] {
-        assert!(proposal(&mut a, block).is_empty());
+        assert!(broadcast(&proposal(&mut a, block)).is_none());
     }
     assert_first_committed(&proposal(&mut a, &b1));
     assert_eq!(a.current_view, 5);

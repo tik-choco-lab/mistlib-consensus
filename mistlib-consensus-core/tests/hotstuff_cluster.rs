@@ -63,6 +63,8 @@ struct Router(Arc<RouterInner>);
 struct RouterInner {
     routes: Mutex<HashMap<NodeId, mpsc::UnboundedSender<(NodeId, HotStuffMessage)>>>,
     dropped: Mutex<HashSet<NodeId>>,
+    dropped_proposals: Mutex<HashSet<u64>>,
+    sync_responses: std::sync::atomic::AtomicUsize,
     /// A small per-hop latency to model an asynchronous network.
     hop_latency: Duration,
 }
@@ -80,6 +82,8 @@ impl Router {
             Router(Arc::new(RouterInner {
                 routes: Mutex::new(routes),
                 dropped: Mutex::new(HashSet::new()),
+                dropped_proposals: Mutex::new(HashSet::new()),
+                sync_responses: std::sync::atomic::AtomicUsize::new(0),
                 hop_latency: Duration::from_millis(3),
             })),
             rxs,
@@ -90,6 +94,10 @@ impl Router {
     /// timers keep firing but reach no peer, modelling a silent leader.
     fn drop_node(&self, id: &NodeId) {
         self.0.dropped.lock().unwrap().insert(id.clone());
+    }
+
+    fn heal_node(&self, id: &NodeId) {
+        self.0.dropped.lock().unwrap().remove(id);
     }
 
     fn transport_for(&self, from: NodeId) -> Arc<dyn HotStuffTransport> {
@@ -111,6 +119,14 @@ impl HotStuffTransport for RouterTransport {
         {
             let dropped = self.router.0.dropped.lock().unwrap();
             if dropped.contains(&self.from) || dropped.contains(to) {
+                if let HotStuffMessage::Proposal { block, .. } = &msg {
+                    self.router
+                        .0
+                        .dropped_proposals
+                        .lock()
+                        .unwrap()
+                        .insert(block.view);
+                }
                 return Ok(());
             }
         }
@@ -121,10 +137,24 @@ impl HotStuffTransport for RouterTransport {
         {
             let dropped = self.router.0.dropped.lock().unwrap();
             if dropped.contains(&self.from) || dropped.contains(to) {
+                if let HotStuffMessage::Proposal { block, .. } = &msg {
+                    self.router
+                        .0
+                        .dropped_proposals
+                        .lock()
+                        .unwrap()
+                        .insert(block.view);
+                }
                 return Ok(());
             }
         }
         if let Some(tx) = self.router.0.routes.lock().unwrap().get(to) {
+            if matches!(msg, HotStuffMessage::BlockResponse { .. }) {
+                self.router
+                    .0
+                    .sync_responses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = tx.send((self.from.clone(), msg));
         }
         Ok(())
@@ -147,6 +177,7 @@ fn pacemaker() -> PacemakerConfig {
     PacemakerConfig {
         base_timeout_ms: 150,
         max_timeout_ms: 2_000,
+        ..PacemakerConfig::default()
     }
 }
 
@@ -570,6 +601,7 @@ async fn mode_facade_smoke() {
         PacemakerConfig {
             base_timeout_ms: 5_000,
             max_timeout_ms: 8_000,
+            ..PacemakerConfig::default()
         },
         Arc::clone(&runtime),
         hs_router.transport_for(hs_id.clone()),
@@ -762,5 +794,87 @@ async fn signed_cluster(verify_delay: StdDuration) {
 
     for n in nodes.values() {
         n.shutdown();
+    }
+}
+
+/// Missed proposals are discarded by the router. Healing only permits new
+/// traffic; the victim must fetch history, agree on the full command log,
+/// and then participate in further commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn permanently_dropped_proposals_are_fetched_after_partition_heals() {
+    let ids: Vec<_> = ["n1", "n2", "n3", "n4", "n5"]
+        .iter()
+        .map(|s| nid(s))
+        .collect();
+    let (router, rxs) = Router::new(&ids);
+    let victim = ids[0].clone();
+    router.drop_node(&victim);
+    let runtime = test_runtime();
+    let nodes = spawn_cluster(&ids, &router, rxs, &runtime);
+    let survivors: Vec<_> = ids.iter().filter(|id| **id != victim).cloned().collect();
+    let survivor_nodes: HashMap<_, _> = survivors
+        .iter()
+        .map(|id| (id.clone(), Arc::clone(&nodes[id])))
+        .collect();
+    let mut streams: HashMap<_, _> = ids
+        .iter()
+        .map(|id| (id.clone(), nodes[id].subscribe_committed()))
+        .collect();
+    let seen = watch_committed(&nodes[&survivors[0]], &runtime);
+    commit_command(
+        &survivor_nodes,
+        &survivors,
+        b"during-partition".to_vec(),
+        &seen,
+        StdDuration::from_secs(30),
+    )
+    .await;
+    wait_for(StdDuration::from_secs(20), || {
+        (nodes[&survivors[0]].committed_height() >= 6).then_some(())
+    })
+    .await;
+    assert!(router.0.dropped_proposals.lock().unwrap().len() >= 4);
+    assert_eq!(nodes[&victim].committed_height(), 0);
+    let before_heal = nodes[&survivors[0]].committed_height();
+    router.heal_node(&victim);
+    wait_for(StdDuration::from_secs(20), || {
+        (nodes[&victim].committed_height() >= before_heal).then_some(())
+    })
+    .await;
+    assert!(
+        router
+            .0
+            .sync_responses
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+    );
+    commit_command(
+        &nodes,
+        &ids,
+        b"after-heal".to_vec(),
+        &seen,
+        StdDuration::from_secs(20),
+    )
+    .await;
+    let mut logs = Vec::new();
+    for id in &ids {
+        logs.push(
+            collect_committed(
+                id,
+                streams.get_mut(id).unwrap(),
+                2,
+                StdDuration::from_secs(20),
+            )
+            .await,
+        );
+    }
+    assert_eq!(logs[0][0].command, b"during-partition");
+    assert_eq!(logs[0][1].command, b"after-heal");
+    for log in &logs[1..] {
+        assert_eq!(log, &logs[0]);
+    }
+    assert!(nodes[&victim].committed_height() > before_heal);
+    for node in nodes.values() {
+        node.shutdown();
     }
 }

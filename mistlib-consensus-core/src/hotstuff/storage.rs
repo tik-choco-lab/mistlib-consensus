@@ -37,6 +37,11 @@ pub struct MemoryBlockStore {
 }
 
 impl MemoryBlockStore {
+    #[cfg(test)]
+    pub(crate) fn blocks_len_for_test(&self) -> usize {
+        self.blocks.len()
+    }
+
     pub fn new() -> Self {
         let genesis = Block::genesis();
         let mut blocks = HashMap::new();

@@ -236,6 +236,15 @@ impl<B: BlockStore + 'static, C: CryptoProvider + 'static> HotStuffNode<B, C> {
                 Output::ResetViewTimer { duration_ms } => {
                     self.arm_view_timer(duration_ms);
                 }
+                Output::ScheduleSyncTick { duration_ms } => {
+                    let this = Arc::clone(self);
+                    self.runtime.spawn(Box::pin(async move {
+                        this.runtime.sleep(Duration::from_millis(duration_ms)).await;
+                        if this.status.lock().unwrap().running {
+                            let _ = this.events_tx.send(NodeEvent::HotStuff(Event::SyncTick));
+                        }
+                    }));
+                }
                 Output::Proposed { view } => {
                     if let Some(reply) = propose_reply.take() {
                         let _ = reply.send(Ok(view));
